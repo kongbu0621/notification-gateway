@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/notification-gateway/schemas/notification-request-v1.json",
+  "title": "NotificationRequest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "idempotency_key",
+    "provider",
+    "subject",
+    "title",
+    "body",
+    "severity",
+    "metadata",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    },
+    "provider": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "subject": {"type": "string", "maxLength": 128},
+    "title": {"type": "string", "minLength": 1, "maxLength": 256},
+    "body": {"type": "string", "minLength": 1, "maxLength": 16384},
+    "severity": {"enum": ["info", "warning", "error", "critical"]},
+    "metadata": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {"minLength": 1, "maxLength": 128}
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    }
+  }
+}
