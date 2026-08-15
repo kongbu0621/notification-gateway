@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterable
+from contextlib import suppress
 
 from .exceptions import ConfigurationError, ProviderNotFoundError
-from .models import NotificationRequest, RequestStatus
+from .models import NotificationRequest, RequestStatus, _is_provider_name
 from .provider import NotificationProvider
 from .store import EnqueueResult, SQLiteStore
 
@@ -29,20 +30,24 @@ class NotificationGateway:
         return tuple(self._providers)
 
     def register(self, provider: NotificationProvider, *, replace: bool = False) -> None:
-        if not isinstance(provider, NotificationProvider):
-            raise ConfigurationError("provider must implement NotificationProvider")
-        name = provider.name.strip()
-        if not name:
-            raise ConfigurationError("provider name must not be empty")
+        name: object = None
+        deliver: object = None
+        with suppress(Exception):
+            name = provider.name
+            deliver = provider.deliver
+        if not _is_provider_name(name) or not callable(deliver):
+            raise ConfigurationError("provider must implement a valid NotificationProvider")
         if name in self._providers and not replace:
-            raise ConfigurationError(f"provider {name!r} is already registered")
+            raise ConfigurationError("provider is already registered")
         self._providers[name] = provider
 
     def provider(self, name: str) -> NotificationProvider:
-        try:
-            return self._providers[name]
-        except KeyError as error:
-            raise ProviderNotFoundError(f"provider {name!r} is not registered") from error
+        if not _is_provider_name(name):
+            raise ProviderNotFoundError("provider is not registered")
+        provider = self._providers.get(name)
+        if provider is None:
+            raise ProviderNotFoundError("provider is not registered")
+        return provider
 
     def accept(
         self, notification: NotificationRequest, *, now: float | None = None

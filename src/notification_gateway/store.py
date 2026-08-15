@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, cast
 
-from .exceptions import ConflictError, RequestNotFoundError
+from .exceptions import ConfigurationError, ConflictError, RequestNotFoundError
 from .models import DeliveryResult, NotificationRequest, RequestStatus
 
 _SCHEMA: Final = """
@@ -59,7 +60,9 @@ _PERSISTED_FAILURES: Final = {
     "provider_delivery_error": "provider reported a delivery failure",
     "unexpected_provider_error": "provider raised an unexpected error",
     "invalid_provider_result": "provider returned invalid delivery evidence",
+    "invalid_stored_payload": "stored notification payload failed integrity validation",
 }
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -71,10 +74,41 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
+def _timestamp_datetime(value: float) -> datetime:
+    return _EPOCH + timedelta(seconds=value)
+
+
+def _require_timestamp(value: object, name: str) -> float:
+    if not _is_finite_number(value):
+        raise ValueError(f"{name} must be a finite, representable Unix timestamp")
+    normalized = float(cast(int | float, value))
+    try:
+        _timestamp_datetime(normalized)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{name} must be a finite, representable Unix timestamp") from None
+    return normalized
+
+
+def _require_duration(value: object, name: str, *, positive: bool) -> float:
+    if not _is_finite_number(value):
+        raise ValueError(f"{name} must be a finite number")
+    normalized = float(cast(int | float, value))
+    invalid = normalized <= 0 if positive else normalized < 0
+    if invalid:
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return normalized
+
+
+def _add_timestamp(timestamp: float, duration: float, name: str) -> float:
+    return _require_timestamp(timestamp + duration, name)
+
+
 def _iso_or_none(value: object) -> str | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(float(cast(float, value)), UTC).isoformat().replace("+00:00", "Z")
+    timestamp = _require_timestamp(value, "stored timestamp")
+    return _timestamp_datetime(timestamp).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,29 +131,52 @@ class SQLiteStore:
         if self.path != ":memory:":
             target = Path(self.path)
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._secure_database_files()
         self._memory_connection: sqlite3.Connection | None = None
         if self.path == ":memory:":
             self._memory_connection = self._new_connection()
         connection = self._connect()
         try:
+            self._reject_future_schema(connection)
             connection.executescript(_SCHEMA)
             self._migrate(connection)
         finally:
             if self._memory_connection is None:
                 connection.close()
         if self.path != ":memory:":
-            os.chmod(self.path, 0o600)
+            self._secure_database_files()
+
+    def _secure_database_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            database_file = Path(f"{self.path}{suffix}")
+            try:
+                os.chmod(database_file, 0o600)
+            except FileNotFoundError:
+                continue
+
+    @staticmethod
+    def _reject_future_schema(connection: sqlite3.Connection) -> None:
+        version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > _SCHEMA_VERSION:
+            raise ConfigurationError("database schema version is newer than supported")
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA secure_delete = ON")
-        if self.path != ":memory:":
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA secure_delete = ON")
+            self._reject_future_schema(connection)
+            if self.path != ":memory:":
+                self._secure_database_files()
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                self._secure_database_files()
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         if self._memory_connection is not None:
@@ -129,7 +186,9 @@ class SQLiteStore:
     @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
         version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
-        if version >= _SCHEMA_VERSION:
+        if version > _SCHEMA_VERSION:
+            raise ConfigurationError("database schema version is newer than supported")
+        if version == _SCHEMA_VERSION:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -167,6 +226,27 @@ class SQLiteStore:
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
+    def _notification_from_row(row: sqlite3.Row) -> NotificationRequest | None:
+        payload = row["payload_json"]
+        stored_hash = row["payload_hash"]
+        if type(payload) is not str or type(stored_hash) is not str:
+            return None
+        try:
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            notification = NotificationRequest.from_json(payload)
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            return None
+        if not stored_hash.isascii() or not hmac.compare_digest(digest, stored_hash):
+            return None
+        if (
+            notification.request_id != row["request_id"]
+            or notification.idempotency_key != row["idempotency_key"]
+            or notification.provider != row["provider"]
+        ):
+            return None
+        return notification
+
+    @staticmethod
     def _begin(connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
 
@@ -188,8 +268,7 @@ class SQLiteStore:
         )
 
     def enqueue(self, notification: NotificationRequest, *, now: float) -> EnqueueResult:
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         payload = notification.to_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         connection = self._connect()
@@ -258,11 +337,9 @@ class SQLiteStore:
     ) -> ClaimedRequest | None:
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
-        if (
-            not all(_is_finite_number(value) for value in (now, lease_seconds))
-            or lease_seconds <= 0
-        ):
-            raise ValueError("now and lease_seconds must be finite, with a positive lease")
+        now = _require_timestamp(now, "now")
+        lease_seconds = _require_duration(lease_seconds, "lease_seconds", positive=True)
+        lease_until = _add_timestamp(now, lease_seconds, "lease deadline")
         connection = self._connect()
         ok = False
         try:
@@ -350,6 +427,21 @@ class SQLiteStore:
                 self._finish(connection, ok=True)
                 return None
             request_id = cast(str, row["request_id"])
+            notification = self._notification_from_row(row)
+            if notification is None:
+                connection.execute(
+                    """
+                    UPDATE notification_requests
+                    SET state = 'dead', next_attempt_at = NULL, lease_until = NULL,
+                        dead_at = ?, last_error_code = 'invalid_stored_payload',
+                        last_error_message = ?
+                    WHERE request_id = ?
+                    """,
+                    (now, _PERSISTED_FAILURES["invalid_stored_payload"], request_id),
+                )
+                ok = True
+                self._finish(connection, ok=True)
+                return None
             attempt_no = cast(int, row["attempt_count"]) + 1
             connection.execute(
                 """
@@ -357,7 +449,7 @@ class SQLiteStore:
                 SET state = 'in_flight', attempt_count = ?, lease_until = ?, next_attempt_at = NULL
                 WHERE request_id = ?
                 """,
-                (attempt_no, now + lease_seconds, request_id),
+                (attempt_no, lease_until, request_id),
             )
             connection.execute(
                 """
@@ -366,10 +458,9 @@ class SQLiteStore:
                 """,
                 (request_id, attempt_no, now),
             )
-            payload = cast(str, row["payload_json"])
             ok = True
             self._finish(connection, ok=True)
-            return ClaimedRequest(NotificationRequest.from_json(payload), attempt_no)
+            return ClaimedRequest(notification, attempt_no)
         except Exception:
             if not ok and connection.in_transaction:
                 self._finish(connection, ok=False)
@@ -386,8 +477,7 @@ class SQLiteStore:
         *,
         now: float,
     ) -> None:
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         connection = self._connect()
         try:
             self._begin(connection)
@@ -436,13 +526,14 @@ class SQLiteStore:
         if _PERSISTED_FAILURES.get(error_code) != error_message:
             raise ValueError("failure code and message must be gateway-owned")
         terminal = exhausted or not retryable
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         if terminal:
             if retry_at is not None:
                 raise ValueError("terminal failures must not have a retry time")
-        elif not _is_finite_number(retry_at):
-            raise ValueError("retryable failures require a finite retry time")
+        elif retry_at is None:
+            raise ValueError("retryable failures require a finite, representable retry time")
+        else:
+            retry_at = _require_timestamp(retry_at, "retry time")
         state = "dead" if terminal else "retry"
         outcome = "dead" if terminal else "retry"
         connection = self._connect()
@@ -499,16 +590,13 @@ class SQLiteStore:
         delivered_retention_seconds: float,
         dead_retention_seconds: float,
     ) -> int:
-        if (
-            not _is_finite_number(now)
-            or not all(
-                _is_finite_number(value)
-                for value in (delivered_retention_seconds, dead_retention_seconds)
-            )
-            or delivered_retention_seconds < 0
-            or dead_retention_seconds < 0
-        ):
-            raise ValueError("retention durations must be finite non-negative numbers")
+        now = _require_timestamp(now, "now")
+        delivered_retention_seconds = _require_duration(
+            delivered_retention_seconds, "delivered retention", positive=False
+        )
+        dead_retention_seconds = _require_duration(
+            dead_retention_seconds, "dead retention", positive=False
+        )
         connection = self._connect()
         try:
             self._begin(connection)

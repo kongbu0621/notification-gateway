@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import make_request
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 
 from notification_gateway import DeliveryResult, NotificationRequest, ValidationError
 from notification_gateway.models import MAX_BODY_CHARS, MAX_METADATA_DEPTH
@@ -60,6 +61,10 @@ def test_schema_rejects_missing_extra_and_invalid_fields() -> None:
     for field in ("title", "body"):
         value = make_request().to_dict() | {field: " \t\n"}
         assert list(validator.iter_errors(value))
+    value = make_request().to_dict() | {"idempotency_key": "   "}
+    assert list(validator.iter_errors(value))
+    with pytest.raises(ValidationError, match="idempotency_key"):
+        NotificationRequest.from_dict(value)
 
 
 @pytest.mark.parametrize(
@@ -98,8 +103,10 @@ def test_from_dict_is_strict_and_requires_json_types() -> None:
         NotificationRequest.from_dict(value)
     with pytest.raises(ValidationError, match="JSON object"):
         NotificationRequest.from_dict([])
-    with pytest.raises(ValidationError, match="valid JSON"):
+    with pytest.raises(ValidationError, match="valid JSON") as invalid_json:
         NotificationRequest.from_json("{")
+    assert invalid_json.value.__cause__ is None
+    assert invalid_json.value.__context__ is None
     non_standard = (
         make_request()
         .to_json()
@@ -107,6 +114,8 @@ def test_from_dict_is_strict_and_requires_json_types() -> None:
     )
     with pytest.raises(ValidationError, match="valid JSON"):
         NotificationRequest.from_json(non_standard)
+    with pytest.raises(ValidationError, match="nesting is too deep"):
+        NotificationRequest.from_json("[" * 10_000 + "0" + "]" * 10_000)
 
 
 def test_created_at_requires_z_but_constructor_normalizes_utc() -> None:
@@ -122,7 +131,7 @@ def test_created_at_requires_z_but_constructor_normalizes_utc() -> None:
 
 
 def test_metadata_is_copied_bounded_and_finite() -> None:
-    metadata = {"nested": {"value": 1}}
+    metadata: dict[str, Any] = {"nested": {"value": 1}}
     request = make_request(metadata=metadata)
     metadata["later"] = True
     metadata["nested"]["value"] = 2

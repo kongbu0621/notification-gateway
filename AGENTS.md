@@ -1,5 +1,7 @@
 # Repository invariants
 
+**English** | [简体中文](AGENTS.zh-CN.md)
+
 These rules are part of the v0.1 contract and apply to humans and coding agents.
 
 1. Durable acceptance precedes provider I/O. Accepted work must survive provider failure and restart.

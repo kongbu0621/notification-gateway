@@ -10,6 +10,7 @@ from typing import Final
 from .exceptions import DeliveryError, ProviderNotFoundError
 from .gateway import NotificationGateway
 from .models import DeliveryResult
+from .store import _add_timestamp, _require_timestamp
 
 _PERSISTED_DELIVERY_ERROR: Final = "provider reported a delivery failure"
 
@@ -71,7 +72,10 @@ class DeliveryWorker:
         self.policy = RetryPolicy() if policy is None else policy
 
     def run_once(self, *, now: float | None = None) -> bool:
-        current = time.time() if now is None else now
+        current = _require_timestamp(time.time() if now is None else now, "now")
+        # Validate the furthest possible retry deadline before claiming work or
+        # invoking a provider. Every actual retry delay is bounded by this one.
+        _add_timestamp(current, self.policy.max_delay_seconds, "retry deadline")
         claim = self.gateway.store.claim_due(
             now=current,
             lease_seconds=self.policy.lease_seconds,
@@ -81,19 +85,17 @@ class DeliveryWorker:
             return False
 
         request = claim.notification
+        failure: tuple[bool, bool, str, str, float | None] | None = None
         try:
             provider = self.gateway.provider(request.provider)
             result = provider.deliver(request)
         except ProviderNotFoundError:
-            self.gateway.store.mark_failed(
-                request.request_id,
-                claim.attempt_no,
-                retryable=False,
-                exhausted=True,
-                error_code="unknown_provider",
-                error_message="configured provider is unavailable",
-                now=current,
-                retry_at=None,
+            failure = (
+                False,
+                True,
+                "unknown_provider",
+                "configured provider is unavailable",
+                None,
             )
         except DeliveryError as error:
             exhausted = claim.attempt_no >= self.policy.max_attempts
@@ -103,40 +105,31 @@ class DeliveryWorker:
                 if retryable and not exhausted
                 else None
             )
-            self.gateway.store.mark_failed(
-                request.request_id,
-                claim.attempt_no,
-                retryable=retryable,
-                exhausted=exhausted,
-                error_code="provider_delivery_error",
-                error_message=_PERSISTED_DELIVERY_ERROR,
-                now=current,
-                retry_at=retry_at,
+            failure = (
+                retryable,
+                exhausted,
+                "provider_delivery_error",
+                _PERSISTED_DELIVERY_ERROR,
+                retry_at,
             )
         except Exception:
             exhausted = claim.attempt_no >= self.policy.max_attempts
             retry_at = current + self.policy.delay_for(claim.attempt_no) if not exhausted else None
-            self.gateway.store.mark_failed(
-                request.request_id,
-                claim.attempt_no,
-                retryable=True,
-                exhausted=exhausted,
-                error_code="unexpected_provider_error",
-                error_message="provider raised an unexpected error",
-                now=current,
-                retry_at=retry_at,
+            failure = (
+                True,
+                exhausted,
+                "unexpected_provider_error",
+                "provider raised an unexpected error",
+                retry_at,
             )
         else:
             if not isinstance(result, DeliveryResult) or result.provider != request.provider:
-                self.gateway.store.mark_failed(
-                    request.request_id,
-                    claim.attempt_no,
-                    retryable=False,
-                    exhausted=True,
-                    error_code="invalid_provider_result",
-                    error_message="provider returned invalid delivery evidence",
-                    now=current,
-                    retry_at=None,
+                failure = (
+                    False,
+                    True,
+                    "invalid_provider_result",
+                    "provider returned invalid delivery evidence",
+                    None,
                 )
             else:
                 self.gateway.store.mark_delivered(
@@ -145,4 +138,22 @@ class DeliveryWorker:
                     result,
                     now=current,
                 )
+                return True
+
+        if failure is None:  # pragma: no cover - every branch above assigns or returns.
+            raise RuntimeError("delivery outcome was not classified")
+        retryable, exhausted, error_code, error_message, retry_at = failure
+        # Persist only after leaving the provider exception handler. If SQLite
+        # fails here, Python cannot attach a secret-bearing provider exception
+        # as the new exception's implicit context.
+        self.gateway.store.mark_failed(
+            request.request_id,
+            claim.attempt_no,
+            retryable=retryable,
+            exhausted=exhausted,
+            error_code=error_code,
+            error_message=error_message,
+            now=current,
+            retry_at=retry_at,
+        )
         return True

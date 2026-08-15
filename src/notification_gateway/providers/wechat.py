@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
+from threading import TIMEOUT_MAX
 from typing import Any, Final
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import parse_qsl, urlparse
 from urllib.request import Request, urlopen
 
@@ -18,6 +21,8 @@ _ALLOWED_HOSTS: Final = frozenset({"qyapi.weixin.qq.com"})
 _WEBHOOK_PATH: Final = "/cgi-bin/webhook/send"
 _MAX_PROVIDER_CONTENT_BYTES: Final = 4_096
 _MAX_RESPONSE_BYTES: Final = 65_536
+_TRANSPORT_FAILED: Final = object()
+_INVALID_RESPONSE: Final = object()
 
 
 def _default_transport(url: str, body: bytes, timeout: float) -> tuple[int, bytes]:
@@ -28,17 +33,22 @@ def _default_transport(url: str, body: bytes, timeout: float) -> tuple[int, byte
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    result: tuple[int, bytes] | None = None
     try:
         with urlopen(request, timeout=timeout) as response:  # noqa: S310
-            return response.status, response.read(_MAX_RESPONSE_BYTES + 1)
+            result = response.status, response.read(_MAX_RESPONSE_BYTES + 1)
     except HTTPError as error:
-        return error.code, error.read(_MAX_RESPONSE_BYTES + 1)
-    except (URLError, TimeoutError, OSError):
+        with suppress(Exception):
+            result = error.code, error.read(_MAX_RESPONSE_BYTES + 1)
+    except Exception:
+        result = None
+    if result is None:
         raise DeliveryError(
             "WeCom transport failed",
             retryable=True,
             code="wecom_transport_error",
-        ) from None
+        )
+    return result
 
 
 @dataclass(slots=True)
@@ -50,14 +60,22 @@ class WeComWebhookProvider:
     transport: Transport = field(default=_default_transport, repr=False)
 
     def __post_init__(self) -> None:
-        parsed = urlparse(self.webhook_url)
+        parsed = None
+        query = None
+        port = None
+        if type(self.webhook_url) is not str:
+            raise ConfigurationError("invalid WeCom webhook URL")
         try:
+            parsed = urlparse(self.webhook_url)
             query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
             port = parsed.port
-        except ValueError:
-            raise ConfigurationError("invalid WeCom webhook URL") from None
+        except (TypeError, ValueError):
+            parsed = None
+            query = None
         if (
-            parsed.scheme != "https"
+            parsed is None
+            or query is None
+            or parsed.scheme != "https"
             or parsed.hostname not in _ALLOWED_HOSTS
             or parsed.username is not None
             or parsed.password is not None
@@ -69,8 +87,14 @@ class WeComWebhookProvider:
             or not query[0][1].strip()
         ):
             raise ConfigurationError("invalid WeCom webhook URL")
-        if self.timeout <= 0:
-            raise ConfigurationError("timeout must be greater than zero")
+        if type(self.timeout) not in {int, float}:
+            raise ConfigurationError("timeout must be a finite supported number")
+        timeout = None
+        with suppress(OverflowError):
+            timeout = float(self.timeout)
+        if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= TIMEOUT_MAX:
+            raise ConfigurationError("timeout must be a finite supported number")
+        self.timeout = timeout
 
     @property
     def name(self) -> str:
@@ -89,7 +113,28 @@ class WeComWebhookProvider:
             )
         payload = {"msgtype": "text", "text": {"content": content}}
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        status, response_body = self.transport(self.webhook_url, body, self.timeout)
+        transport_result: object = _TRANSPORT_FAILED
+        with suppress(Exception):
+            transport_result = self.transport(self.webhook_url, body, self.timeout)
+        if transport_result is _TRANSPORT_FAILED:
+            raise DeliveryError(
+                "WeCom transport failed",
+                retryable=True,
+                code="wecom_transport_error",
+            )
+        if type(transport_result) is not tuple or len(transport_result) != 2:
+            raise DeliveryError(
+                "WeCom returned an invalid response",
+                retryable=True,
+                code="wecom_invalid_response",
+            )
+        status, response_body = transport_result
+        if type(status) is not int or not 100 <= status <= 599 or type(response_body) is not bytes:
+            raise DeliveryError(
+                "WeCom returned an invalid response",
+                retryable=True,
+                code="wecom_invalid_response",
+            )
         if len(response_body) > _MAX_RESPONSE_BYTES:
             raise DeliveryError(
                 "WeCom returned an oversized response",
@@ -103,14 +148,15 @@ class WeComWebhookProvider:
                 retryable=retryable,
                 code=f"wecom_http_{status}" if 100 <= status <= 599 else "wecom_http_error",
             )
-        try:
-            response: Any = json.loads(response_body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        response: Any = _INVALID_RESPONSE
+        with suppress(UnicodeDecodeError, ValueError, RecursionError):
+            response = json.loads(response_body)
+        if response is _INVALID_RESPONSE:
             raise DeliveryError(
                 "WeCom returned an invalid response",
                 retryable=True,
                 code="wecom_invalid_response",
-            ) from None
+            )
         if not isinstance(response, dict) or type(response.get("errcode")) is not int:
             raise DeliveryError(
                 "WeCom returned an invalid response",

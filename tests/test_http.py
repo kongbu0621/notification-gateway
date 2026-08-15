@@ -32,11 +32,16 @@ def call(
     path: str,
     *,
     payload: object | None = None,
+    raw_payload: bytes | None = None,
     content_type: str = "application/json",
     token: str | None = None,
     content_length: str | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
-    raw = b"" if payload is None else json.dumps(payload).encode()
+    raw = (
+        raw_payload
+        if raw_payload is not None
+        else (b"" if payload is None else json.dumps(payload).encode())
+    )
     environ: dict[str, Any] = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
@@ -106,6 +111,21 @@ def test_http_rejects_invalid_requests(tmp_path: Path, payload: object | None) -
     assert call(app(tmp_path), "POST", "/v1/notifications", payload=payload)[0].startswith("400")
 
 
+def test_http_rejects_deep_json_without_internal_error(tmp_path: Path) -> None:
+    raw = ("[" * 10_000 + "0" + "]" * 10_000).encode()
+    status, _, body = call(app(tmp_path), "POST", "/v1/notifications", raw_payload=raw)
+    assert status.startswith("400")
+    assert body["error"] == "invalid_request"
+
+
+def test_http_does_not_echo_unknown_field_names(tmp_path: Path) -> None:
+    secret = "caller-secret-field-name"
+    payload = make_request().to_dict() | {secret: True}
+    status, _, body = call(app(tmp_path), "POST", "/v1/notifications", payload=payload)
+    assert status.startswith("400")
+    assert secret not in json.dumps(body)
+
+
 def test_http_content_type_length_routes_and_health(tmp_path: Path) -> None:
     service = app(tmp_path)
     assert call(service, "GET", "/healthz")[0].startswith("200")
@@ -134,3 +154,10 @@ def test_http_bearer_auth_is_secret_safe(tmp_path: Path) -> None:
     assert call(service, "GET", "/v1/notifications/missing", token=token)[0].startswith("404")
     with pytest.raises(ValueError, match="32"):
         GatewayWSGIApp(service.gateway, auth_token="short")
+
+    unicode_token = "密" * 32
+    unicode_service = app(tmp_path, token=unicode_token)
+    assert call(unicode_service, "GET", "/v1/notifications/missing", token=unicode_token)[
+        0
+    ].startswith("404")
+    assert unicode_service._authorized({"HTTP_AUTHORIZATION": b"not-a-string"}) is False

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -10,6 +12,7 @@ import pytest
 from conftest import make_request
 
 from notification_gateway import (
+    ConfigurationError,
     ConflictError,
     DeliveryError,
     DeliveryResult,
@@ -50,6 +53,10 @@ def test_sqlite_file_permissions_are_owner_only(tmp_path: Path) -> None:
     SQLiteStore(db)
     assert db.stat().st_mode & 0o777 == 0o600
     assert db.parent.stat().st_mode & 0o777 == 0o700
+
+    db.chmod(0o644)
+    SQLiteStore(db)
+    assert db.stat().st_mode & 0o777 == 0o600
 
 
 def test_v2_migration_redacts_legacy_provider_evidence(tmp_path: Path) -> None:
@@ -103,6 +110,28 @@ def test_v2_migration_redacts_legacy_provider_evidence(tmp_path: Path) -> None:
         assert b"legacy-secret" not in database_file.read_bytes()
 
 
+def test_future_database_schema_version_is_rejected(tmp_path: Path) -> None:
+    db = tmp_path / "future.sqlite3"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE future_only (value TEXT)")
+    connection.execute("PRAGMA user_version = 999")
+    connection.commit()
+    original_journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    connection.close()
+
+    with pytest.raises(ConfigurationError, match="newer than supported"):
+        SQLiteStore(db)
+
+    connection = sqlite3.connect(db)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 999
+    tables = {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert tables == {"future_only"}
+    assert connection.execute("PRAGMA journal_mode").fetchone()[0] == original_journal_mode
+    connection.close()
+
+
 def test_durable_idempotent_intake_and_key_reuse(tmp_path: Path) -> None:
     service = gateway(tmp_path)
     first = make_request()
@@ -119,6 +148,48 @@ def test_durable_idempotent_intake_and_key_reuse(tmp_path: Path) -> None:
         service.accept(make_request(title="Different"), now=40)
     with pytest.raises(ValueError, match="finite"):
         service.accept(make_request(request_id="invalid-time"), now=float("inf"))
+
+
+def test_concurrent_intake_commits_once_and_replays_the_rest(tmp_path: Path) -> None:
+    database = tmp_path / "concurrent.sqlite3"
+    request = make_request()
+
+    def accept_once(_: int) -> bool:
+        service = NotificationGateway(SQLiteStore(database), [FakeProvider()])
+        return service.accept(request, now=0).replayed
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        replayed = list(executor.map(accept_once, range(16)))
+
+    assert replayed.count(False) == 1
+    assert replayed.count(True) == 15
+    assert SQLiteStore(database).get_status(request.request_id).state == "pending"
+
+
+def test_concurrent_workers_claim_each_request_once(tmp_path: Path) -> None:
+    received: list[NotificationRequest] = []
+    service = gateway(tmp_path, FakeProvider(received=received))
+    for index in range(20):
+        service.accept(make_request(request_id=f"concurrent-{index:02d}"), now=0)
+
+    def work_once(_: int) -> bool:
+        return DeliveryWorker(service).run_once(now=0)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        worked = list(executor.map(work_once, range(20)))
+
+    assert all(worked)
+    assert len(received) == 20
+    assert len({request.request_id for request in received}) == 20
+    assert all(service.status(request.request_id).state == "delivered" for request in received)
+
+
+def test_unrepresentable_intake_time_is_rejected_without_commit(tmp_path: Path) -> None:
+    service = gateway(tmp_path)
+    with pytest.raises(ValueError, match="representable"):
+        service.accept(make_request(), now=1e308)
+    with pytest.raises(RequestNotFoundError):
+        service.status("demo-event-001")
 
 
 def test_unknown_provider_is_rejected_before_durable_intake(tmp_path: Path) -> None:
@@ -237,6 +308,57 @@ def test_claim_rejects_invalid_attempt_and_time_configuration(tmp_path: Path) ->
         store.claim_due(now=10**5000, lease_seconds=1)
 
 
+def test_unrepresentable_lease_is_rejected_without_state_change(tmp_path: Path) -> None:
+    service = gateway(tmp_path)
+    service.accept(make_request(), now=0)
+    with pytest.raises(ValueError, match="lease deadline"):
+        service.store.claim_due(now=200_000_000_000, lease_seconds=100_000_000_000)
+    status = service.status("demo-event-001")
+    assert status.state == "pending"
+    assert status.attempt_count == 0
+    assert service.store.attempts_for_testing("demo-event-001") == []
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["invalid-json", "hash-mismatch", "non-ascii-hash", "identity-mismatch"],
+)
+def test_corrupt_stored_payload_becomes_dead_before_provider_io(
+    tmp_path: Path, corruption: str
+) -> None:
+    received: list[NotificationRequest] = []
+    service = gateway(tmp_path, FakeProvider(received=received))
+    service.accept(make_request(), now=0)
+    database = tmp_path / "notifications.sqlite3"
+    connection = sqlite3.connect(database)
+    if corruption == "invalid-json":
+        payload = "{"
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+    elif corruption == "hash-mismatch":
+        payload = make_request(title="Tampered").to_json()
+        digest = "0" * 64
+    elif corruption == "non-ascii-hash":
+        payload = make_request().to_json()
+        digest = "密" * 64
+    else:
+        payload = make_request(request_id="different-event").to_json()
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+    connection.execute(
+        "UPDATE notification_requests SET payload_json = ?, payload_hash = ?",
+        (payload, digest),
+    )
+    connection.commit()
+    connection.close()
+
+    assert DeliveryWorker(service).run_once(now=0) is False
+    status = service.status("demo-event-001")
+    assert status.state == "dead"
+    assert status.attempt_count == 0
+    assert status.last_error_code == "invalid_stored_payload"
+    assert received == []
+    assert service.store.attempts_for_testing("demo-event-001") == []
+
+
 def test_store_rejects_non_gateway_failure_evidence(tmp_path: Path) -> None:
     service = gateway(tmp_path)
     service.accept(make_request(), now=0)
@@ -293,6 +415,17 @@ def test_store_rejects_non_gateway_failure_evidence(tmp_path: Path) -> None:
             now=0,
             retry_at=None,
         )
+    with pytest.raises(ValueError, match="representable"):
+        service.store.mark_failed(
+            claim.notification.request_id,
+            claim.attempt_no,
+            retryable=True,
+            exhausted=False,
+            error_code="provider_delivery_error",
+            error_message="provider reported a delivery failure",
+            now=0,
+            retry_at=1e308,
+        )
 
 
 def test_provider_io_occurs_outside_write_transaction(tmp_path: Path) -> None:
@@ -336,6 +469,40 @@ def test_unexpected_provider_secret_is_not_persisted(tmp_path: Path) -> None:
     assert "never-store-me" not in (tmp_path / "notifications.sqlite3").read_bytes().decode(
         "utf-8", errors="ignore"
     )
+
+
+def test_provider_secret_is_not_exception_context_when_persistence_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "provider-secret-never-log"
+    service = gateway(tmp_path, FakeProvider(outcomes=[RuntimeError(secret)]))
+    service.accept(make_request(), now=0)
+
+    def fail_persistence(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("simulated database failure")
+
+    monkeypatch.setattr(service.store, "mark_failed", fail_persistence)
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        DeliveryWorker(service).run_once(now=0)
+
+    assert raised.value.__context__ is None
+    assert secret not in "".join(traceback.format_exception(raised.value))
+
+
+def test_unrepresentable_retry_horizon_is_rejected_before_claim_or_provider_io(
+    tmp_path: Path,
+) -> None:
+    received: list[NotificationRequest] = []
+    service = gateway(tmp_path, FakeProvider(received=received))
+    service.accept(make_request(), now=0)
+    worker = DeliveryWorker(
+        service,
+        RetryPolicy(base_delay_seconds=1e308, max_delay_seconds=1e308),
+    )
+    with pytest.raises(ValueError, match="retry deadline"):
+        worker.run_once(now=0)
+    assert received == []
+    assert service.status("demo-event-001").state == "pending"
 
 
 def test_declared_delivery_error_text_is_not_persisted(tmp_path: Path) -> None:
@@ -414,7 +581,7 @@ def test_non_result_provider_output_becomes_dead_without_retry(tmp_path: Path) -
         name: str = "fake"
 
         def deliver(self, notification: NotificationRequest) -> DeliveryResult:
-            return cast(Any, None)
+            return cast(DeliveryResult, None)
 
     service = NotificationGateway(
         SQLiteStore(tmp_path / "notifications.sqlite3"), [InvalidProvider()]
@@ -483,7 +650,7 @@ def test_terminal_purge_cascades_attempts_but_preserves_pending(tmp_path: Path) 
         {"lease_seconds": cast(Any, "60")},
     ],
 )
-def test_retry_policy_validation(kwargs: dict[str, float]) -> None:
+def test_retry_policy_validation(kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         RetryPolicy(**kwargs)
 
@@ -510,3 +677,25 @@ def test_provider_registry_errors(tmp_path: Path) -> None:
     service.register(FakeProvider(), replace=True)
     with pytest.raises(Exception, match="implement"):
         service.register(object())  # type: ignore[arg-type]
+    with pytest.raises(ConfigurationError, match="valid"):
+        service.register(FakeProvider(name=" fake "))
+
+    secret = "provider-name-secret-never-log"
+
+    class SecretNameProvider:
+        @property
+        def name(self) -> str:
+            raise RuntimeError(secret)
+
+        def deliver(self, notification: NotificationRequest) -> DeliveryResult:
+            return DeliveryResult("fake")
+
+    with pytest.raises(ConfigurationError) as raised:
+        service.register(SecretNameProvider())
+    assert raised.value.__cause__ is None
+    assert secret not in "".join(traceback.format_exception(raised.value))
+
+    with pytest.raises(ProviderNotFoundError) as missing:
+        service.provider("caller-private-provider-name")
+    assert missing.value.__context__ is None
+    assert "caller-private-provider-name" not in str(missing.value)

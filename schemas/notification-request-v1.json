@@ -67,7 +67,10 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
-      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+      "allOf": [
+        {"pattern": "^[^\\u0000-\\u001F\\u007F]+$"},
+        {"pattern": "\\S"}
+      ]
     },
     "provider": {
       "type": "string",

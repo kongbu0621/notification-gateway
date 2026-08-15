@@ -1,5 +1,7 @@
 # Security policy
 
+**English** | [简体中文](SECURITY.zh-CN.md)
+
 ## Supported version
 
 `0.1.x` is the only supported line while the project is in alpha.
