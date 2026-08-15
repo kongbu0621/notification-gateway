@@ -88,7 +88,49 @@ def test_repository_ignores_runtime_and_contains_public_safety_docs() -> None:
     assert "gateway.log" in ignored
     assert Path("AGENTS.md").is_file()
     assert Path("SECURITY.md").is_file()
+    assert Path("SECURITY.zh-CN.md").is_file()
+    assert Path("README.zh-CN.md").is_file()
     assert Path("docs/privacy-and-mainland-china.md").is_file()
+    assert Path("docs/privacy-and-mainland-china.zh-CN.md").is_file()
+
+
+def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> None:
+    pairs = [
+        (Path("README.md"), Path("README.zh-CN.md"), "README.zh-CN.md", "README.md"),
+        (
+            Path("SECURITY.md"),
+            Path("SECURITY.zh-CN.md"),
+            "SECURITY.zh-CN.md",
+            "SECURITY.md",
+        ),
+        (
+            Path("docs/privacy-and-mainland-china.md"),
+            Path("docs/privacy-and-mainland-china.zh-CN.md"),
+            "privacy-and-mainland-china.zh-CN.md",
+            "privacy-and-mainland-china.md",
+        ),
+    ]
+    for english_path, chinese_path, chinese_link, english_link in pairs:
+        english = english_path.read_text(encoding="utf-8")
+        chinese = chinese_path.read_text(encoding="utf-8")
+        assert f"]({chinese_link})" in english
+        assert f"]({english_link})" in chinese
+        assert re.search(r"[\u4e00-\u9fff]", chinese)
+        assert english.count("\n## ") == chinese.count("\n## ")
+        assert english.count("```") == chinese.count("```")
+
+    chinese_readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
+    for term in (
+        "NotificationRequest",
+        "DeliveryResult",
+        "SQLite",
+        "WAL",
+        "at-least-once",
+        "retry",
+        "lease",
+        "JSON Schema",
+    ):
+        assert term in chinese_readme
 
 
 def test_tracked_files_do_not_contain_external_task_links_or_real_secrets() -> None:

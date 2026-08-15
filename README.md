@@ -1,5 +1,7 @@
 # notification-gateway
 
+**English** | [简体中文](README.zh-CN.md)
+
 `notification-gateway` is a small, typed Python service/library for durably accepting notification requests and delivering them through pluggable providers. v0.1 uses SQLite, an at-least-once worker, a minimal WSGI HTTP boundary, and a WeCom-compatible group-robot adapter.
 
 It owns request validation, durable intake, provider routing, bounded retry, restart recovery, status, retention cleanup, and secret-safe delivery outcome accounting. It does not own caller-specific monitoring, scheduling, scraping, product workflow, recipient management, or business rules.
@@ -121,7 +123,7 @@ Notification content and metadata are opaque caller data. They are durably persi
 
 Prefer generic content plus an opaque event reference. Never put passwords, tokens, recovery codes, identity-document numbers, financial credentials, unrestricted student profiles, or other unnecessary personal information in notification requests.
 
-See [privacy and mainland-China deployment boundary](docs/privacy-and-mainland-china.md) and [security policy](SECURITY.md).
+See [privacy and mainland-China deployment boundary](docs/privacy-and-mainland-china.md) and [security policy](SECURITY.md). Simplified-Chinese counterparts are available for the [privacy/deployment guidance](docs/privacy-and-mainland-china.zh-CN.md) and [security policy](SECURITY.zh-CN.md).
 
 ## Retention
 

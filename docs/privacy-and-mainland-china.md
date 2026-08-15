@@ -1,5 +1,7 @@
 # Privacy and mainland-China deployment boundary
 
+**English** | [简体中文](privacy-and-mainland-china.zh-CN.md)
+
 This document is engineering guidance, not legal certification or legal advice. The gateway is jurisdiction-neutral software; the organization operating it remains responsible for its processing purpose, data, recipients, providers, retention, deployment, and notices.
 
 ## Public source code is not a public notification service

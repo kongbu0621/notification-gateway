@@ -48,8 +48,10 @@ include = [
   "/tests",
   "/docs",
   "/README.md",
+  "/README.zh-CN.md",
   "/AGENTS.md",
   "/SECURITY.md",
+  "/SECURITY.zh-CN.md",
   "/LICENSE",
   "/.env.example",
 ]
