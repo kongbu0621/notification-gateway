@@ -2,9 +2,50 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-`notification-gateway` is a small, typed Python service/library for durably accepting notification requests and delivering them through pluggable providers. v0.1 uses SQLite, an at-least-once worker, a minimal WSGI HTTP boundary, and a WeCom-compatible group-robot adapter.
+`notification-gateway` is a reusable, single-node reliable-notification delivery layer (durable notification queue) for trusted internal applications. A producer hands off an important notification; the module commits it to SQLite before Provider I/O, performs bounded retry and restart recovery, and exposes delivery status.
 
-It owns request validation, durable intake, provider routing, bounded retry, restart recovery, status, retention cleanup, and secret-safe delivery outcome accounting. It does not own caller-specific monitoring, scheduling, scraping, product workflow, recipient management, or business rules.
+It does not detect events or decide when to notify. v0.1 provides a typed Python library, a minimal WSGI HTTP intake/status boundary, an externally driven at-least-once Worker, and one built-in WeCom-compatible group-robot Adapter.
+
+## What this module is for
+
+Use `notification-gateway` between an application that produces an important event and the Provider that sends the message. A direct Webhook call can silently lose the notification when the network or Provider fails, or when the producing process stops at the wrong moment. After this module successfully accepts a notification, the caller can safely replay the same request if acknowledgement was ambiguous; the durable record is then delivered with retry and restart recovery.
+
+```text
+event producer (monitor / business service / agent)
+        |
+        v
+notification-gateway
+  accept -> SQLite -> Worker -> Provider (WeCom today)
+              |          |
+              +-- retry / restart recovery --+
+```
+
+Examples include a stock monitor reporting that an item is available, an Agent reporting that a long-running task needs human attention, or a business service reporting an operational failure. The producer decides **what** and **when** to notify; this module owns reliable delivery after acceptance.
+
+| Reuse question | v0.1 answer |
+| --- | --- |
+| What is the value? | Durable handoff, idempotent replay of the same request, bounded retry, restart recovery, status, and explicit terminal-record purge. |
+| Where does the reliability guarantee begin? | After `accept` returns or HTTP intake returns success. The module cannot atomically join the producer's business-database transaction; the producer must retry ambiguous handoff or use its own transactional outbox when that gap matters. |
+| What is the delivery guarantee? | At-least-once, not exactly-once. A crash after Provider acceptance but before local acknowledgement can produce a duplicate message. |
+| What must run? | `serve` only accepts requests and returns status. A private supervisor or scheduler must invoke `work-once` repeatedly; each invocation delivers at most one due request. |
+| Which channels are built in? | WeCom only. An embedding Python application can register additional Provider implementations; v0.1 has no runtime plugin discovery/loading or generic Provider configuration system. |
+| Where is state stored? | One local SQLite database. Notification content is persisted. On POSIX, database/WAL/SHM files are set to owner-only modes, but the module does not encrypt notification content at the application layer; the operator must protect storage and backups. |
+| What is deliberately absent? | Event detection, business scheduling, recipients, templates, dashboard, dead-letter alerting, high availability, tenant isolation, and a hardened public edge. |
+
+Reuse this module when:
+
+- An accepted notification must survive a process restart, temporary network failure, or Provider outage.
+- Multiple trusted internal applications under one operator need the same durable intake, retry, status, and retention boundary.
+- A caller needs explicit `pending`, `retry`, `delivered`, or `dead` state instead of a best-effort Webhook call.
+- A new delivery channel should be added as a Provider Adapter without adding product-specific logic to Core.
+
+Do not use this module when:
+
+- Losing an occasional best-effort notification is acceptable and a direct Webhook call is sufficient.
+- Duplicate delivery is unacceptable and the recipient cannot make repeated messages harmless.
+- A business change and notification enqueue must commit atomically, but the producer has no transactional outbox or equivalent retry mechanism.
+- You need event detection, monitoring, scheduling, recipient management, templates, or business rules; those remain caller responsibilities.
+- You need a hardened public, multi-tenant notification platform; that is outside the v0.1 boundary.
 
 ## Status
 

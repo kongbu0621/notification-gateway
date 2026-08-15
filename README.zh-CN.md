@@ -2,9 +2,50 @@
 
 [English](README.md) | **简体中文**
 
-`notification-gateway` 是一个小型、带类型标注（typed）的 Python service/library，用于持久化接收通知请求，并通过可插拔 Provider 完成投递。v0.1 使用 SQLite、at-least-once Worker、最小化 WSGI HTTP boundary，以及兼容 WeCom（企业微信）群机器人的 Adapter。
+`notification-gateway` 是一个面向可信内部应用、可复用的单机可靠通知投递层（durable notification queue）。Producer 把重要 notification 交给本模块；模块会在 Provider I/O 前先 commit 到 SQLite，然后执行 bounded retry、restart recovery，并提供 delivery status。
 
-本工程负责 request validation、durable intake、provider routing、bounded retry、restart recovery、status、retention cleanup，以及 secret-safe delivery outcome accounting。它不负责调用方特定的 monitoring、scheduling、scraping、product workflow、recipient management 或 business rules。
+它不负责 event detection，也不决定何时通知。v0.1 提供 typed Python library、最小化 WSGI HTTP intake/status boundary、由外部驱动的 at-least-once Worker，以及一个内置的 WeCom-compatible 群机器人 Adapter。
+
+## 这个模块有什么用（What this module is for）
+
+应当把 `notification-gateway` 放在“产生重要 event 的应用”和“真正发送消息的 Provider”之间。应用直接调用 Webhook 时，如果 network、Provider 临时失败，或者应用在不恰当的时刻停止，通知可能静默丢失。本模块成功接受 notification 后，如果 acknowledgement 是否成功不明确，caller 可以安全重放完全相同的 request；durable record 随后通过 retry 与 restart recovery 完成投递。
+
+```text
+event producer (monitor / business service / agent)
+        |
+        v
+notification-gateway
+  accept -> SQLite -> Worker -> Provider (WeCom today)
+              |          |
+              +-- retry / restart recovery --+
+```
+
+典型场景包括：库存 monitor 发现商品到货、Agent 的长任务需要人工关注，或者 business service 出现 operational failure。Producer 决定**通知什么、何时通知**；本模块负责 notification 被接受之后的 reliable delivery。
+
+| 复用问题 | v0.1 的答案 |
+| --- | --- |
+| 核心价值是什么？ | Durable handoff、相同 request 的 idempotent replay、bounded retry、restart recovery、status 与显式 terminal-record purge。 |
+| 可靠性保证从哪里开始？ | 从 `accept` 返回或 HTTP intake 成功返回之后开始。本模块无法与 Producer 的 business-database transaction 进行 atomic commit；如果这个间隙很重要，Producer 必须重试结果不明确的 handoff，或者使用自己的 transactional outbox。 |
+| 投递保证是什么？ | At-least-once，不是 exactly-once。如果 Provider 已接受消息、但进程在本地 acknowledgement 前崩溃，可能产生 duplicate message。 |
+| 必须运行什么？ | `serve` 只负责接收 request 和返回 status。Private supervisor 或 scheduler 必须反复调用 `work-once`；每次最多投递一个到期 request。 |
+| 内置哪些 channel？ | 目前只有 WeCom。嵌入式 Python application 可以注册其他 Provider implementation；v0.1 没有 runtime plugin discovery/loading 或通用 Provider configuration system。 |
+| 状态保存在哪里？ | 一个本地 SQLite database。Notification content 会被持久化。在 POSIX 上，database/WAL/SHM file 会设置为 owner-only mode，但模块不会在 application layer 加密 notification content；Operator 仍须保护 storage 与 backup。 |
+| 明确不包含什么？ | Event detection、business scheduling、recipient、template、dashboard、dead-letter alerting、high availability、tenant isolation 与 hardened public edge。 |
+
+以下情况适合复用本模块：
+
+- 已接受的 notification 必须能承受 process restart、临时 network failure 或 Provider outage。
+- 同一运营者边界内的多个可信内部应用需要复用同一套 durable intake、retry、status 与 retention boundary。
+- 调用方需要明确的 `pending`、`retry`、`delivered` 或 `dead` 状态，而不是 best-effort Webhook call。
+- 新 delivery channel 应作为 Provider Adapter 接入，而不是把 product-specific logic 加入 Core。
+
+以下情况不需要使用本模块：
+
+- 偶尔丢失一条 best-effort notification 可以接受，直接调用 Webhook 已经足够。
+- 绝对不能发生 duplicate delivery，并且 recipient 无法让重复消息变得无害。
+- Business change 与 notification enqueue 必须 atomic commit，但 Producer 没有 transactional outbox 或等效 retry mechanism。
+- 需要的是 event detection、monitoring、scheduling、recipient management、template 或 business rule；这些仍属于 caller responsibility。
+- 需要 hardened public、multi-tenant notification platform；这超出 v0.1 boundary。
 
 ## 项目状态（Status）
 
