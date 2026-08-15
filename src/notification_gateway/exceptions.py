@@ -28,7 +28,7 @@ class ProviderNotFoundError(NotificationGatewayError, LookupError):
 
 
 class DeliveryError(NotificationGatewayError):
-    """A provider failed without exposing provider secrets or raw responses."""
+    """A provider failed; rendered text is deliberately fixed and secret-safe."""
 
     def __init__(
         self,
@@ -37,6 +37,10 @@ class DeliveryError(NotificationGatewayError):
         retryable: bool = False,
         code: str = "delivery_error",
     ) -> None:
-        super().__init__(message)
+        # Provider-authored exception text is not a safe logging boundary. Keep
+        # the parameter for v0.1 source compatibility, but never retain or
+        # render it; callers can branch on the in-process code and retryability.
+        del message
+        super().__init__("notification delivery failed")
         self.retryable = retryable
         self.code = code

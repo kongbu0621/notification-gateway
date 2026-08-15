@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -51,6 +52,57 @@ def test_sqlite_file_permissions_are_owner_only(tmp_path: Path) -> None:
     assert db.parent.stat().st_mode & 0o777 == 0o700
 
 
+def test_v2_migration_redacts_legacy_provider_evidence(tmp_path: Path) -> None:
+    db = tmp_path / "notifications.sqlite3"
+    service = NotificationGateway(SQLiteStore(db), [FakeProvider()])
+    service.accept(make_request(), now=0)
+    claim = service.store.claim_due(now=0, lease_seconds=10)
+    assert claim is not None
+    connection = sqlite3.connect(db)
+    connection.execute(
+        """
+        UPDATE notification_requests
+        SET provider_message_id = 'legacy-secret',
+            provider_details_json = '{"raw":"legacy-secret"}',
+            last_error_code = 'legacy-secret', last_error_message = 'legacy-secret'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE delivery_attempts
+        SET provider_message_id = 'legacy-secret',
+            provider_details_json = '{"raw":"legacy-secret"}',
+            error_code = 'legacy-secret', error_message = 'legacy-secret'
+        """
+    )
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+
+    SQLiteStore(db)
+    connection = sqlite3.connect(db)
+    request_row = connection.execute(
+        """
+        SELECT provider_message_id, provider_details_json,
+               last_error_code, last_error_message
+        FROM notification_requests
+        """
+    ).fetchone()
+    attempt_row = connection.execute(
+        """
+        SELECT provider_message_id, provider_details_json, error_code, error_message
+        FROM delivery_attempts
+        """
+    ).fetchone()
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    connection.close()
+    assert request_row == (None, None, "legacy_error_redacted", None)
+    assert attempt_row == (None, None, "legacy_error_redacted", None)
+    assert version == 2
+    for database_file in tmp_path.glob("notifications.sqlite3*"):
+        assert b"legacy-secret" not in database_file.read_bytes()
+
+
 def test_durable_idempotent_intake_and_key_reuse(tmp_path: Path) -> None:
     service = gateway(tmp_path)
     first = make_request()
@@ -65,6 +117,8 @@ def test_durable_idempotent_intake_and_key_reuse(tmp_path: Path) -> None:
 
     with pytest.raises(ConflictError):
         service.accept(make_request(title="Different"), now=40)
+    with pytest.raises(ValueError, match="finite"):
+        service.accept(make_request(request_id="invalid-time"), now=float("inf"))
 
 
 def test_unknown_provider_is_rejected_before_durable_intake(tmp_path: Path) -> None:
@@ -75,7 +129,7 @@ def test_unknown_provider_is_rejected_before_durable_intake(tmp_path: Path) -> N
         service.status("demo-event-001")
 
 
-def test_success_marks_delivered_and_persists_evidence(tmp_path: Path) -> None:
+def test_success_marks_delivered_without_persisting_provider_evidence(tmp_path: Path) -> None:
     provider = FakeProvider(received=[])
     service = gateway(tmp_path, provider)
     service.accept(make_request(), now=1)
@@ -86,7 +140,8 @@ def test_success_marks_delivered_and_persists_evidence(tmp_path: Path) -> None:
     assert provider.received and provider.received[0].request_id == "demo-event-001"
     attempts = service.store.attempts_for_testing("demo-event-001")
     assert attempts[0]["outcome"] == "delivered"
-    assert attempts[0]["provider_message_id"] == "msg-1"
+    assert attempts[0]["provider_message_id"] is None
+    assert attempts[0]["provider_details_json"] is None
 
 
 def test_retry_backoff_survives_restart(tmp_path: Path) -> None:
@@ -154,6 +209,92 @@ def test_crash_lease_recovery_reuses_request_id(tmp_path: Path) -> None:
     assert attempts[0]["finished_at"] == 10
 
 
+def test_crash_lease_recovery_honors_max_attempts(tmp_path: Path) -> None:
+    service = gateway(tmp_path)
+    service.accept(make_request(), now=0)
+    first = service.store.claim_due(now=0, lease_seconds=1, max_attempts=2)
+    assert first is not None and first.attempt_no == 1
+    second = service.store.claim_due(now=1, lease_seconds=1, max_attempts=2)
+    assert second is not None and second.attempt_no == 2
+    assert service.store.claim_due(now=2, lease_seconds=1, max_attempts=2) is None
+    status = service.status("demo-event-001")
+    assert status.state == "dead"
+    assert status.attempt_count == 2
+    assert status.last_error_code == "lease_expired_exhausted"
+    attempts = service.store.attempts_for_testing("demo-event-001")
+    assert [attempt["outcome"] for attempt in attempts] == ["retry", "dead"]
+
+
+def test_claim_rejects_invalid_attempt_and_time_configuration(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "notifications.sqlite3")
+    with pytest.raises(ValueError, match="max_attempts"):
+        store.claim_due(now=0, lease_seconds=1, max_attempts=0)
+    with pytest.raises(ValueError, match="finite"):
+        store.claim_due(now=float("nan"), lease_seconds=1)
+    with pytest.raises(ValueError, match="finite"):
+        store.claim_due(now=cast(Any, "not-a-number"), lease_seconds=1)
+    with pytest.raises(ValueError, match="finite"):
+        store.claim_due(now=10**5000, lease_seconds=1)
+
+
+def test_store_rejects_non_gateway_failure_evidence(tmp_path: Path) -> None:
+    service = gateway(tmp_path)
+    service.accept(make_request(), now=0)
+    claim = service.store.claim_due(now=0, lease_seconds=1)
+    assert claim is not None
+    with pytest.raises(ValueError, match="gateway-owned"):
+        service.store.mark_failed(
+            claim.notification.request_id,
+            claim.attempt_no,
+            retryable=False,
+            exhausted=True,
+            error_code="secretcredential123",
+            error_message="secret diagnostic",
+            now=0,
+            retry_at=None,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        service.store.mark_delivered(
+            claim.notification.request_id,
+            claim.attempt_no,
+            DeliveryResult("fake"),
+            now=float("nan"),
+        )
+    with pytest.raises(ValueError, match="now"):
+        service.store.mark_failed(
+            claim.notification.request_id,
+            claim.attempt_no,
+            retryable=False,
+            exhausted=True,
+            error_code="provider_delivery_error",
+            error_message="provider reported a delivery failure",
+            now=float("inf"),
+            retry_at=None,
+        )
+    with pytest.raises(ValueError, match="must not have"):
+        service.store.mark_failed(
+            claim.notification.request_id,
+            claim.attempt_no,
+            retryable=False,
+            exhausted=True,
+            error_code="provider_delivery_error",
+            error_message="provider reported a delivery failure",
+            now=0,
+            retry_at=1,
+        )
+    with pytest.raises(ValueError, match="require a finite"):
+        service.store.mark_failed(
+            claim.notification.request_id,
+            claim.attempt_no,
+            retryable=True,
+            exhausted=False,
+            error_code="provider_delivery_error",
+            error_message="provider reported a delivery failure",
+            now=0,
+            retry_at=None,
+        )
+
+
 def test_provider_io_occurs_outside_write_transaction(tmp_path: Path) -> None:
     db = tmp_path / "notifications.sqlite3"
 
@@ -199,14 +340,18 @@ def test_unexpected_provider_secret_is_not_persisted(tmp_path: Path) -> None:
 
 def test_declared_delivery_error_text_is_not_persisted(tmp_path: Path) -> None:
     secret = "https://example.invalid/hook?token=never-store-me"
+    error = DeliveryError(secret, retryable=False, code="provider_rejected")
+    assert secret not in repr(error)
+    assert secret not in "".join(traceback.format_exception(error))
     service = gateway(
         tmp_path,
-        FakeProvider(outcomes=[DeliveryError(secret, retryable=False, code="provider_rejected")]),
+        FakeProvider(outcomes=[error]),
     )
     service.accept(make_request(), now=0)
     assert DeliveryWorker(service).run_once(now=0)
     attempts = service.store.attempts_for_testing("demo-event-001")
     assert attempts[0]["error_message"] == "provider reported a delivery failure"
+    assert attempts[0]["error_code"] == "provider_delivery_error"
     assert secret not in repr(attempts)
     assert "never-store-me" not in (tmp_path / "notifications.sqlite3").read_bytes().decode(
         "utf-8", errors="ignore"
@@ -226,6 +371,41 @@ def test_mismatched_provider_result_becomes_dead_without_retry(tmp_path: Path) -
     attempts = service.store.attempts_for_testing("demo-event-001")
     assert attempts[0]["outcome"] == "dead"
     assert attempts[0]["provider_message_id"] is None
+
+
+def test_provider_identifiers_details_and_codes_never_persist(tmp_path: Path) -> None:
+    secret_id = "gh" + "p_" + "a" * 40
+    secret_detail = "https://example.invalid/provider?token=never-store"
+    provider = FakeProvider(
+        outcomes=[
+            DeliveryResult(
+                "fake",
+                secret_id,
+                {"raw_response": secret_detail, "huge": 10**5000},
+            )
+        ]
+    )
+    service = gateway(tmp_path, provider)
+    service.accept(make_request(), now=0)
+    assert DeliveryWorker(service).run_once(now=0)
+    database = (tmp_path / "notifications.sqlite3").read_bytes()
+    assert secret_id.encode() not in database
+    assert secret_detail.encode() not in database
+    assert service.status("demo-event-001").state == "delivered"
+
+    second = make_request(request_id="demo-event-002")
+    service.register(
+        FakeProvider(
+            outcomes=[
+                DeliveryError("ignored diagnostic", retryable=False, code="secretcredential123")
+            ]
+        ),
+        replace=True,
+    )
+    service.accept(second, now=1)
+    assert DeliveryWorker(service).run_once(now=1)
+    assert service.status(second.request_id).last_error_code == "provider_delivery_error"
+    assert b"secretcredential123" not in (tmp_path / "notifications.sqlite3").read_bytes()
 
 
 def test_non_result_provider_output_becomes_dead_without_retry(tmp_path: Path) -> None:
@@ -282,6 +462,10 @@ def test_terminal_purge_cascades_attempts_but_preserves_pending(tmp_path: Path) 
         service.store.purge_terminal(
             now=1, delivered_retention_seconds=float("nan"), dead_retention_seconds=1
         )
+    with pytest.raises(ValueError, match="finite"):
+        service.store.purge_terminal(
+            now=float("inf"), delivered_retention_seconds=1, dead_retention_seconds=1
+        )
 
 
 @pytest.mark.parametrize(
@@ -295,6 +479,8 @@ def test_terminal_purge_cascades_attempts_but_preserves_pending(tmp_path: Path) 
         {"base_delay_seconds": float("nan")},
         {"lease_seconds": float("inf")},
         {"max_attempts": True},
+        {"lease_seconds": 10**5000},
+        {"lease_seconds": cast(Any, "60")},
     ],
 )
 def test_retry_policy_validation(kwargs: dict[str, float]) -> None:
@@ -308,6 +494,13 @@ def test_retry_policy_rejects_invalid_attempt_and_caps_delay() -> None:
         policy.delay_for(0)
     assert policy.delay_for(2) == 3
     assert policy.delay_for(1_000_000) == 3
+    wide = RetryPolicy(base_delay_seconds=1, max_delay_seconds=1e100)
+    assert wide.delay_for(65) == 2.0**64
+    below_power = RetryPolicy(base_delay_seconds=0.9999999999999999, max_delay_seconds=2.0**64)
+    assert below_power.delay_for(65) == 18_446_744_073_709_549_568
+    overflow = RetryPolicy(base_delay_seconds=1e308, max_delay_seconds=1.7e308)
+    assert overflow.delay_for(2) == 1.7e308
+    assert RetryPolicy(base_delay_seconds=3, max_delay_seconds=3).delay_for(1) == 3
 
 
 def test_provider_registry_errors(tmp_path: Path) -> None:

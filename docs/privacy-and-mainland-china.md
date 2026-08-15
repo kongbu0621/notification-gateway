@@ -6,6 +6,8 @@ This document is engineering guidance, not legal certification or legal advice. 
 
 Publishing generic source code does not by itself mean that the repository processes end-user personal information. Operating the HTTP service, persisting requests, or delivering messages can do so when caller-supplied subject, title, body, metadata, identifiers, or provider evidence relates to an identified or identifiable person.
 
+Caller-supplied notification fields are opaque and are persisted for durable delivery. The gateway does not reliably detect passwords, tokens, URLs, personal information, or other sensitive material embedded in those fields. Secret-safety guarantees for provider credentials and transport evidence do not convert caller content into safe or lawful data.
+
 Keep repository history free of real credentials, personal email addresses, notification payloads, databases, logs, local paths, screenshots, and external task-sharing links. Contributors should use a GitHub-provided `users.noreply.github.com` commit address when they do not intend to publish an email address.
 
 ## Data minimization

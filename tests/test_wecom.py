@@ -49,7 +49,7 @@ def test_repr_and_delivery_do_not_expose_webhook_secret() -> None:
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send",
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x#fragment",
-        "https://user:password@qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x",
+        "https://@qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x",
         "https://qyapi.weixin.qq.com:8443/cgi-bin/webhook/send?key=x",
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x&debug=true",
         "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=x&key=y",
@@ -66,9 +66,10 @@ def test_rejects_invalid_timeout_and_oversized_content() -> None:
     with pytest.raises(ConfigurationError, match="timeout"):
         WeComWebhookProvider(URL, timeout=0)
     provider = WeComWebhookProvider(URL, transport=StubTransport())
-    with pytest.raises(DeliveryError, match="size limit") as raised:
+    with pytest.raises(DeliveryError) as raised:
         provider.deliver(make_request(provider="wecom", body="界" * 2000))
     assert raised.value.retryable is False
+    assert raised.value.code == "wecom_content_too_large"
 
 
 @pytest.mark.parametrize(("status", "retryable"), [(400, False), (429, True), (500, True)])
@@ -130,7 +131,7 @@ def test_default_transport_success_http_and_network_errors(monkeypatch: pytest.M
         raise wechat.URLError("offline")
 
     monkeypatch.setattr(wechat, "urlopen", network_error)
-    with pytest.raises(DeliveryError, match="transport failed") as raised:
+    with pytest.raises(DeliveryError) as raised:
         wechat._default_transport(URL, b"{}", 1)
     assert raised.value.__cause__ is None
     assert "test-only-dummy-key" not in "".join(traceback.format_exception(raised.value))

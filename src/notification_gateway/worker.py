@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
-from math import isfinite
+from math import isfinite, ldexp
 from typing import Final
 
 from .exceptions import DeliveryError, ProviderNotFoundError
 from .gateway import NotificationGateway
 from .models import DeliveryResult
 
-_SAFE_CODE: Final = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _PERSISTED_DELIVERY_ERROR: Final = "provider reported a delivery failure"
 
 
-def _safe_code(value: object) -> str:
-    return value if isinstance(value, str) and _SAFE_CODE.fullmatch(value) else "delivery_error"
+def _is_finite_number(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return isfinite(value)  # type: ignore[arg-type]
+    except OverflowError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +34,7 @@ class RetryPolicy:
         if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
         if not all(
-            type(value) in {int, float} and isfinite(value)
+            _is_finite_number(value)
             for value in (self.base_delay_seconds, self.max_delay_seconds, self.lease_seconds)
         ):
             raise ValueError("retry delays and lease must be finite numbers")
@@ -45,9 +48,18 @@ class RetryPolicy:
     def delay_for(self, attempt_no: int) -> float:
         if type(attempt_no) is not int or attempt_no < 1:
             raise ValueError("attempt_no must be at least one")
-        if attempt_no - 1 >= 64 or self.base_delay_seconds >= self.max_delay_seconds:
+        exponent = attempt_no - 1
+        if self.base_delay_seconds >= self.max_delay_seconds:
             return self.max_delay_seconds
-        delay = self.base_delay_seconds * (2.0 ** (attempt_no - 1))
+        # The ratio between the smallest and largest finite IEEE-754 float is
+        # below 2**2100. This guard avoids converting an attacker-sized int to
+        # float while preserving every representable exponential delay.
+        if exponent > 2_100:
+            return self.max_delay_seconds
+        try:
+            delay = ldexp(self.base_delay_seconds, exponent)
+        except OverflowError:
+            return self.max_delay_seconds
         return min(self.max_delay_seconds, delay)
 
 
@@ -63,6 +75,7 @@ class DeliveryWorker:
         claim = self.gateway.store.claim_due(
             now=current,
             lease_seconds=self.policy.lease_seconds,
+            max_attempts=self.policy.max_attempts,
         )
         if claim is None:
             return False
@@ -84,21 +97,25 @@ class DeliveryWorker:
             )
         except DeliveryError as error:
             exhausted = claim.attempt_no >= self.policy.max_attempts
-            retry_at = current + self.policy.delay_for(claim.attempt_no)
             retryable = error.retryable is True
+            retry_at = (
+                current + self.policy.delay_for(claim.attempt_no)
+                if retryable and not exhausted
+                else None
+            )
             self.gateway.store.mark_failed(
                 request.request_id,
                 claim.attempt_no,
                 retryable=retryable,
                 exhausted=exhausted,
-                error_code=_safe_code(error.code),
+                error_code="provider_delivery_error",
                 error_message=_PERSISTED_DELIVERY_ERROR,
                 now=current,
                 retry_at=retry_at,
             )
         except Exception:
             exhausted = claim.attempt_no >= self.policy.max_attempts
-            retry_at = current + self.policy.delay_for(claim.attempt_no)
+            retry_at = current + self.policy.delay_for(claim.attempt_no) if not exhausted else None
             self.gateway.store.mark_failed(
                 request.request_id,
                 claim.attempt_no,
