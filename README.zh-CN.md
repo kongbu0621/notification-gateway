@@ -6,6 +6,35 @@
 
 本工程负责 request validation、durable intake、provider routing、bounded retry、restart recovery、status、retention cleanup，以及 secret-safe delivery outcome accounting。它不负责调用方特定的 monitoring、scheduling、scraping、product workflow、recipient management 或 business rules。
 
+## 这个模块有什么用（What this module is for）
+
+应当把 `notification-gateway` 放在“产生重要 event 的应用”和“真正发送消息的 Provider”之间。应用直接调用 Webhook 时，如果 network、Provider 临时失败，或者应用在不恰当的时刻停止，通知可能静默丢失。本模块会先接收并持久化 notification，再通过 retry 与 restart recovery 完成投递。
+
+```text
+event producer (monitor / business service / agent)
+        |
+        v
+notification-gateway
+  accept -> SQLite -> Worker -> Provider (WeCom today)
+              |          |
+              +-- retry / restart recovery --+
+```
+
+典型场景包括：库存 monitor 发现商品到货、Agent 的长任务需要人工关注，或者 business service 出现 operational failure。Producer 决定**通知什么、何时通知**；本模块负责 notification 被接受之后的 reliable delivery。
+
+以下情况适合复用本模块：
+
+- 已接受的 notification 必须能承受 process restart、临时 network failure 或 Provider outage。
+- 多个应用需要复用同一套 durable intake、retry、status 与 retention boundary。
+- 调用方需要明确的 `pending`、`retry`、`delivered` 或 `dead` 状态，而不是 best-effort Webhook call。
+- 新 delivery channel 应作为 Provider Adapter 接入，而不是把 product-specific logic 加入 Core。
+
+以下情况不需要使用本模块：
+
+- 偶尔丢失一条 best-effort notification 可以接受，直接调用 Webhook 已经足够。
+- 需要的是 event detection、monitoring、scheduling、recipient management、template 或 business rule；这些仍属于 caller responsibility。
+- 需要 hardened public、multi-tenant notification platform；这超出 v0.1 boundary。
+
 ## 项目状态（Status）
 
 v0.1 是 alpha software，仅适用于 loopback 或受控 private network 部署。它不是经过加固的公网入口（hardened public Internet edge），不提供 public-service authentication、tenant isolation、TLS termination 或通用 abuse protection。

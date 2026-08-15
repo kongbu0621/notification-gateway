@@ -156,7 +156,22 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
                     f"broken local link {target!r} in {document_path}"
                 )
 
+    english_readme = Path("README.md").read_text(encoding="utf-8")
     chinese_readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
+    for phrase in (
+        "## What this module is for",
+        "Reuse this module when:",
+        "Do not use this module when:",
+        "a direct Webhook call is sufficient",
+    ):
+        assert phrase in english_readme
+    for phrase in (
+        "## 这个模块有什么用（What this module is for）",
+        "以下情况适合复用本模块：",
+        "以下情况不需要使用本模块：",
+        "直接调用 Webhook 已经足够",
+    ):
+        assert phrase in chinese_readme
     for term in (
         "NotificationRequest",
         "DeliveryResult",

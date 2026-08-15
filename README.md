@@ -6,6 +6,35 @@
 
 It owns request validation, durable intake, provider routing, bounded retry, restart recovery, status, retention cleanup, and secret-safe delivery outcome accounting. It does not own caller-specific monitoring, scheduling, scraping, product workflow, recipient management, or business rules.
 
+## What this module is for
+
+Use `notification-gateway` between an application that produces an important event and the Provider that sends the message. A direct Webhook call can silently lose the notification when the network or Provider fails, or when the producing process stops at the wrong moment. This module first accepts and persists the notification, then delivers it with retry and restart recovery.
+
+```text
+event producer (monitor / business service / agent)
+        |
+        v
+notification-gateway
+  accept -> SQLite -> Worker -> Provider (WeCom today)
+              |          |
+              +-- retry / restart recovery --+
+```
+
+Examples include a stock monitor reporting that an item is available, an Agent reporting that a long-running task needs human attention, or a business service reporting an operational failure. The producer decides **what** and **when** to notify; this module owns reliable delivery after acceptance.
+
+Reuse this module when:
+
+- An accepted notification must survive a process restart, temporary network failure, or Provider outage.
+- Multiple applications need the same durable intake, retry, status, and retention boundary.
+- A caller needs explicit `pending`, `retry`, `delivered`, or `dead` state instead of a best-effort Webhook call.
+- A new delivery channel should be added as a Provider Adapter without adding product-specific logic to Core.
+
+Do not use this module when:
+
+- Losing an occasional best-effort notification is acceptable and a direct Webhook call is sufficient.
+- You need event detection, monitoring, scheduling, recipient management, templates, or business rules; those remain caller responsibilities.
+- You need a hardened public, multi-tenant notification platform; that is outside the v0.1 boundary.
+
 ## Status
 
 v0.1 is alpha software for loopback or controlled private-network deployment. It is not a hardened public Internet edge and does not provide public-service authentication, tenant isolation, TLS termination, or general abuse protection.
