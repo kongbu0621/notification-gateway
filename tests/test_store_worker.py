@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from conftest import make_request
@@ -196,6 +197,55 @@ def test_unexpected_provider_secret_is_not_persisted(tmp_path: Path) -> None:
     )
 
 
+def test_declared_delivery_error_text_is_not_persisted(tmp_path: Path) -> None:
+    secret = "https://example.invalid/hook?token=never-store-me"
+    service = gateway(
+        tmp_path,
+        FakeProvider(outcomes=[DeliveryError(secret, retryable=False, code="provider_rejected")]),
+    )
+    service.accept(make_request(), now=0)
+    assert DeliveryWorker(service).run_once(now=0)
+    attempts = service.store.attempts_for_testing("demo-event-001")
+    assert attempts[0]["error_message"] == "provider reported a delivery failure"
+    assert secret not in repr(attempts)
+    assert "never-store-me" not in (tmp_path / "notifications.sqlite3").read_bytes().decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def test_mismatched_provider_result_becomes_dead_without_retry(tmp_path: Path) -> None:
+    service = gateway(
+        tmp_path,
+        FakeProvider(outcomes=[DeliveryResult("other", "message-1", {"accepted": True})]),
+    )
+    service.accept(make_request(), now=0)
+    assert DeliveryWorker(service).run_once(now=0)
+    status = service.status("demo-event-001")
+    assert status.state == "dead"
+    assert status.last_error_code == "invalid_provider_result"
+    attempts = service.store.attempts_for_testing("demo-event-001")
+    assert attempts[0]["outcome"] == "dead"
+    assert attempts[0]["provider_message_id"] is None
+
+
+def test_non_result_provider_output_becomes_dead_without_retry(tmp_path: Path) -> None:
+    @dataclass
+    class InvalidProvider:
+        name: str = "fake"
+
+        def deliver(self, notification: NotificationRequest) -> DeliveryResult:
+            return cast(Any, None)
+
+    service = NotificationGateway(
+        SQLiteStore(tmp_path / "notifications.sqlite3"), [InvalidProvider()]
+    )
+    service.accept(make_request(), now=0)
+    assert DeliveryWorker(service).run_once(now=0)
+    status = service.status("demo-event-001")
+    assert status.state == "dead"
+    assert status.last_error_code == "invalid_provider_result"
+
+
 def test_provider_removed_after_intake_becomes_dead(tmp_path: Path) -> None:
     db = tmp_path / "notifications.sqlite3"
     initial = NotificationGateway(SQLiteStore(db), [FakeProvider()])
@@ -228,6 +278,10 @@ def test_terminal_purge_cascades_attempts_but_preserves_pending(tmp_path: Path) 
         service.store.purge_terminal(
             now=1, delivered_retention_seconds=-1, dead_retention_seconds=1
         )
+    with pytest.raises(ValueError, match="finite"):
+        service.store.purge_terminal(
+            now=1, delivered_retention_seconds=float("nan"), dead_retention_seconds=1
+        )
 
 
 @pytest.mark.parametrize(
@@ -238,6 +292,9 @@ def test_terminal_purge_cascades_attempts_but_preserves_pending(tmp_path: Path) 
         {"max_delay_seconds": 0},
         {"base_delay_seconds": 2, "max_delay_seconds": 1},
         {"lease_seconds": 0},
+        {"base_delay_seconds": float("nan")},
+        {"lease_seconds": float("inf")},
+        {"max_attempts": True},
     ],
 )
 def test_retry_policy_validation(kwargs: dict[str, float]) -> None:
@@ -250,6 +307,7 @@ def test_retry_policy_rejects_invalid_attempt_and_caps_delay() -> None:
     with pytest.raises(ValueError, match="attempt_no"):
         policy.delay_for(0)
     assert policy.delay_for(2) == 3
+    assert policy.delay_for(1_000_000) == 3
 
 
 def test_provider_registry_errors(tmp_path: Path) -> None:

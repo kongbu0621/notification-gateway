@@ -33,8 +33,8 @@
       "pattern": "^[a-z][a-z0-9_-]{0,63}$"
     },
     "subject": {"type": "string", "maxLength": 128},
-    "title": {"type": "string", "minLength": 1, "maxLength": 256},
-    "body": {"type": "string", "minLength": 1, "maxLength": 16384},
+    "title": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
+    "body": {"type": "string", "minLength": 1, "maxLength": 16384, "pattern": "\\S"},
     "severity": {"enum": ["info", "warning", "error", "critical"]},
     "metadata": {
       "type": "object",

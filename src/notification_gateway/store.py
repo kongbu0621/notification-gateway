@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -376,8 +377,17 @@ class SQLiteStore:
         delivered_retention_seconds: float,
         dead_retention_seconds: float,
     ) -> int:
-        if delivered_retention_seconds < 0 or dead_retention_seconds < 0:
-            raise ValueError("retention durations must not be negative")
+        if (
+            not all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                for value in (delivered_retention_seconds, dead_retention_seconds)
+            )
+            or delivered_retention_seconds < 0
+            or dead_retention_seconds < 0
+        ):
+            raise ValueError("retention durations must be finite non-negative numbers")
         connection = self._connect()
         try:
             self._begin(connection)

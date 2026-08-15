@@ -21,12 +21,19 @@ MAX_METADATA_DEPTH: Final = 4
 MAX_METADATA_BYTES: Final = 4_096
 MAX_REQUEST_BYTES: Final = 32_768
 MAX_IDEMPOTENCY_KEY_CHARS: Final = 256
+MAX_PROVIDER_MESSAGE_ID_CHARS: Final = 128
+MAX_PROVIDER_DETAIL_KEYS: Final = 16
 
 Severity = Literal["info", "warning", "error", "critical"]
 SEVERITIES: Final = frozenset({"info", "warning", "error", "critical"})
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROVIDER = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _IDEMPOTENCY_KEY = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+_PROVIDER_MESSAGE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_PROVIDER_DETAIL_KEY = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_SENSITIVE_DETAIL_KEY = re.compile(
+    r"(?:auth|cookie|credential|header|key|password|raw|response|secret|token|url)", re.I
+)
 _EXPECTED_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -100,7 +107,29 @@ def _copy_metadata(value: object) -> Mapping[str, Any]:
     if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValidationError("metadata is too large")
     copied = cast(dict[str, Any], json.loads(encoded))
-    return MappingProxyType(copied)
+    return cast(Mapping[str, Any], _freeze_json(copied))
+
+
+def _metadata_object(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("metadata must be an object")
+    return cast(Mapping[str, Any], value)
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 def _utc_text(value: datetime) -> str:
@@ -174,7 +203,7 @@ class NotificationRequest:
             title=_require_string(value["title"], "title"),
             body=_require_string(value["body"], "body"),
             severity=cast(Severity, severity),
-            metadata=_copy_metadata(value["metadata"]),
+            metadata=_metadata_object(value["metadata"]),
             created_at=_parse_created_at(value["created_at"]),
         )
 
@@ -196,7 +225,7 @@ class NotificationRequest:
             "title": self.title,
             "body": self.body,
             "severity": self.severity,
-            "metadata": dict(self.metadata),
+            "metadata": _thaw_json(self.metadata),
             "created_at": _utc_text(self.created_at),
         }
 
@@ -210,10 +239,24 @@ class DeliveryResult:
 
     provider: str
     message_id: str | None = field(default=None, repr=False)
-    details: Mapping[str, str | int | bool | None] = field(default_factory=dict, repr=False)
+    details: Mapping[str, int | bool | None] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+        if not _PROVIDER.fullmatch(self.provider):
+            raise ValidationError("delivery result provider has an invalid format")
+        if self.message_id is not None and not _PROVIDER_MESSAGE_ID.fullmatch(self.message_id):
+            raise ValidationError("provider message ID has an invalid format")
+        copied = dict(self.details)
+        if len(copied) > MAX_PROVIDER_DETAIL_KEYS:
+            raise ValidationError("provider details contain too many keys")
+        for key, value in copied.items():
+            if not isinstance(key, str) or not _PROVIDER_DETAIL_KEY.fullmatch(key):
+                raise ValidationError("provider detail key has an invalid format")
+            if _SENSITIVE_DETAIL_KEY.search(key):
+                raise ValidationError("provider detail key is not safe to persist")
+            if value is not None and type(value) not in {int, bool}:
+                raise ValidationError("provider detail value must be a scalar")
+        object.__setattr__(self, "details", MappingProxyType(copied))
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,22 +5,19 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
+from math import isfinite
 from typing import Final
 
 from .exceptions import DeliveryError, ProviderNotFoundError
 from .gateway import NotificationGateway
+from .models import DeliveryResult
 
 _SAFE_CODE: Final = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
-_MAX_ERROR_CHARS: Final = 160
+_PERSISTED_DELIVERY_ERROR: Final = "provider reported a delivery failure"
 
 
-def _safe_code(value: str) -> str:
-    return value if _SAFE_CODE.fullmatch(value) else "delivery_error"
-
-
-def _safe_message(value: str) -> str:
-    sanitized = " ".join(value.replace("\x00", "").split())
-    return sanitized[:_MAX_ERROR_CHARS] or "notification delivery failed"
+def _safe_code(value: object) -> str:
+    return value if isinstance(value, str) and _SAFE_CODE.fullmatch(value) else "delivery_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,8 +28,13 @@ class RetryPolicy:
     lease_seconds: float = 60.0
 
     def __post_init__(self) -> None:
-        if self.max_attempts < 1:
+        if type(self.max_attempts) is not int or self.max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
+        if not all(
+            type(value) in {int, float} and isfinite(value)
+            for value in (self.base_delay_seconds, self.max_delay_seconds, self.lease_seconds)
+        ):
+            raise ValueError("retry delays and lease must be finite numbers")
         if self.base_delay_seconds <= 0 or self.max_delay_seconds <= 0:
             raise ValueError("retry delays must be positive")
         if self.base_delay_seconds > self.max_delay_seconds:
@@ -41,8 +43,10 @@ class RetryPolicy:
             raise ValueError("lease_seconds must be positive")
 
     def delay_for(self, attempt_no: int) -> float:
-        if attempt_no < 1:
+        if type(attempt_no) is not int or attempt_no < 1:
             raise ValueError("attempt_no must be at least one")
+        if attempt_no - 1 >= 64 or self.base_delay_seconds >= self.max_delay_seconds:
+            return self.max_delay_seconds
         delay = self.base_delay_seconds * (2.0 ** (attempt_no - 1))
         return min(self.max_delay_seconds, delay)
 
@@ -81,13 +85,14 @@ class DeliveryWorker:
         except DeliveryError as error:
             exhausted = claim.attempt_no >= self.policy.max_attempts
             retry_at = current + self.policy.delay_for(claim.attempt_no)
+            retryable = error.retryable is True
             self.gateway.store.mark_failed(
                 request.request_id,
                 claim.attempt_no,
-                retryable=error.retryable,
+                retryable=retryable,
                 exhausted=exhausted,
                 error_code=_safe_code(error.code),
-                error_message=_safe_message(str(error)),
+                error_message=_PERSISTED_DELIVERY_ERROR,
                 now=current,
                 retry_at=retry_at,
             )
@@ -105,10 +110,22 @@ class DeliveryWorker:
                 retry_at=retry_at,
             )
         else:
-            self.gateway.store.mark_delivered(
-                request.request_id,
-                claim.attempt_no,
-                result,
-                now=current,
-            )
+            if not isinstance(result, DeliveryResult) or result.provider != request.provider:
+                self.gateway.store.mark_failed(
+                    request.request_id,
+                    claim.attempt_no,
+                    retryable=False,
+                    exhausted=True,
+                    error_code="invalid_provider_result",
+                    error_message="provider returned invalid delivery evidence",
+                    now=current,
+                    retry_at=None,
+                )
+            else:
+                self.gateway.store.mark_delivered(
+                    request.request_id,
+                    claim.attempt_no,
+                    result,
+                    now=current,
+                )
         return True

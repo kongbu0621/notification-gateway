@@ -82,7 +82,10 @@ def test_http_failures_are_normalized(status: int, retryable: bool) -> None:
     assert "errmsg" not in rendered
 
 
-@pytest.mark.parametrize("response", [b"not json", b"[]", b"{}", b"x" * 65537])
+@pytest.mark.parametrize(
+    "response",
+    [b"not json", b"[]", b"{}", b'{"errcode":false}', b"x" * 65537],
+)
 def test_invalid_provider_responses_are_normalized(response: bytes) -> None:
     provider = WeComWebhookProvider(URL, transport=StubTransport(response=response))
     with pytest.raises(DeliveryError) as raised:

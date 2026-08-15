@@ -1,0 +1,8 @@
+# Direct CI/build toolchain constraints. Dependabot keeps this file reviewable.
+build==1.5.0
+hatchling==1.32.0
+jsonschema==4.26.0
+mypy==2.3.0
+pytest==9.1.1
+pytest-cov==7.1.0
+ruff==0.16.2

@@ -50,6 +50,14 @@ def _gateway(db_path: str) -> NotificationGateway:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "purge":
+        count = SQLiteStore(args.db).purge_terminal(
+            now=time.time(),
+            delivered_retention_seconds=args.delivered_retention,
+            dead_retention_seconds=args.dead_retention,
+        )
+        print(count)
+        return 0
     gateway = _gateway(args.db)
     if args.command == "serve":
         try:
@@ -81,12 +89,4 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         )
         return 0 if worker.run_once() else 3
-    if args.command == "purge":
-        count = gateway.store.purge_terminal(
-            now=time.time(),
-            delivered_retention_seconds=args.delivered_retention,
-            dead_retention_seconds=args.dead_retention,
-        )
-        print(count)
-        return 0
     return 2

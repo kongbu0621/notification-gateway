@@ -109,7 +109,9 @@ Non-loopback binding is refused unless `--allow-non-loopback` is explicit, and i
 - Expired in-flight leases become retryable work using the same request ID.
 - Permanent failures and exhausted retries become `dead`.
 - Provider I/O does not occur inside a SQLite write transaction.
-- Provider errors are normalized and bounded before persistence.
+- Provider error text is never persisted; only a bounded code and gateway-owned generic message
+  are stored. Successful evidence is type-, key-, size-, and provider-identity checked before
+  persistence.
 
 ## Secrets and privacy
 
@@ -127,7 +129,7 @@ SQLite durability is not a permanent message archive. `purge_terminal` removes d
 
 ## Add a provider
 
-A provider implements a stable `name` and `deliver(NotificationRequest) -> DeliveryResult`. Provider transport must be injectable so tests never use external services. A provider must document its operator, expected data region when known, possible cross-border transfer, accepted data classification, size limits, retry semantics, and approval requirements.
+A provider implements a stable `name` and `deliver(NotificationRequest) -> DeliveryResult`. Provider transport must be injectable so tests never use external services. Delivery errors may contain diagnostic text for an in-process caller, but the worker never persists that text. Successful evidence accepts only a bounded identifier and bounded scalar details; string details and secret-bearing keys are rejected. A provider must document its operator, expected data region when known, possible cross-border transfer, accepted data classification, size limits, retry semantics, and approval requirements.
 
 No provider should claim that data remains in a jurisdiction based only on a hostname.
 

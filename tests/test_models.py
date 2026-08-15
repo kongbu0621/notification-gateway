@@ -42,9 +42,9 @@ def test_repr_hides_request_content_and_delivery_evidence() -> None:
     ):
         assert private_value not in rendered
 
-    result = DeliveryResult("fake", "private-message-id", {"evidence": "private-evidence"})
+    result = DeliveryResult("fake", "private-message-id", {"accepted": True})
     assert "private-message-id" not in repr(result)
-    assert "private-evidence" not in repr(result)
+    assert "accepted" not in repr(result)
 
 
 def test_schema_rejects_missing_extra_and_invalid_fields() -> None:
@@ -57,6 +57,9 @@ def test_schema_rejects_missing_extra_and_invalid_fields() -> None:
     assert list(validator.iter_errors(value))
     value = make_request().to_dict() | {"created_at": "2026-01-01T08:00:00+08:00"}
     assert list(validator.iter_errors(value))
+    for field in ("title", "body"):
+        value = make_request().to_dict() | {field: " \t\n"}
+        assert list(validator.iter_errors(value))
 
 
 @pytest.mark.parametrize(
@@ -114,6 +117,11 @@ def test_metadata_is_copied_bounded_and_finite() -> None:
     metadata["later"] = True
     metadata["nested"]["value"] = 2
     assert request.to_dict()["metadata"] == {"nested": {"value": 1}}
+    projected = request.to_dict()
+    projected["metadata"]["nested"]["value"] = 3
+    assert request.to_dict()["metadata"] == {"nested": {"value": 1}}
+    with pytest.raises(TypeError):
+        request.metadata["nested"]["value"] = 4
 
     nested: object = "leaf"
     for _ in range(MAX_METADATA_DEPTH + 1):
@@ -138,3 +146,22 @@ def test_from_dict_rejects_wrong_primitive_types() -> None:
     value["created_at"] = "not-a-dateZ"
     with pytest.raises(ValidationError, match="RFC 3339"):
         NotificationRequest.from_dict(value)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"provider": "Bad"},
+        {"message_id": "https://example.invalid/?token=secret"},
+        {"details": {"raw_response": 1}},
+        {"details": {"token": 1}},
+        {"details": {"evidence": "arbitrary provider text"}},
+        {"details": {"nested": {"value": 1}}},
+        {"details": {f"value_{index}": index for index in range(17)}},
+    ],
+)
+def test_delivery_result_rejects_unsafe_or_unbounded_evidence(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        DeliveryResult(**({"provider": "fake"} | kwargs))  # type: ignore[arg-type]
