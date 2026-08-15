@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import os
 import sqlite3
@@ -59,6 +60,7 @@ _PERSISTED_FAILURES: Final = {
     "provider_delivery_error": "provider reported a delivery failure",
     "unexpected_provider_error": "provider raised an unexpected error",
     "invalid_provider_result": "provider returned invalid delivery evidence",
+    "invalid_stored_payload": "stored notification payload failed integrity validation",
 }
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -129,29 +131,52 @@ class SQLiteStore:
         if self.path != ":memory:":
             target = Path(self.path)
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._secure_database_files()
         self._memory_connection: sqlite3.Connection | None = None
         if self.path == ":memory:":
             self._memory_connection = self._new_connection()
         connection = self._connect()
         try:
+            self._reject_future_schema(connection)
             connection.executescript(_SCHEMA)
             self._migrate(connection)
         finally:
             if self._memory_connection is None:
                 connection.close()
         if self.path != ":memory:":
-            os.chmod(self.path, 0o600)
+            self._secure_database_files()
+
+    def _secure_database_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            database_file = Path(f"{self.path}{suffix}")
+            try:
+                os.chmod(database_file, 0o600)
+            except FileNotFoundError:
+                continue
+
+    @staticmethod
+    def _reject_future_schema(connection: sqlite3.Connection) -> None:
+        version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > _SCHEMA_VERSION:
+            raise ConfigurationError("database schema version is newer than supported")
 
     def _new_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA secure_delete = ON")
-        if self.path != ":memory:":
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA secure_delete = ON")
+            self._reject_future_schema(connection)
+            if self.path != ":memory:":
+                self._secure_database_files()
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                self._secure_database_files()
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         if self._memory_connection is not None:
@@ -199,6 +224,27 @@ class SQLiteStore:
         # Set the version only after physical cleanup succeeds. A failed
         # checkpoint/VACUUM therefore retries the fail-closed migration later.
         connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _notification_from_row(row: sqlite3.Row) -> NotificationRequest | None:
+        payload = row["payload_json"]
+        stored_hash = row["payload_hash"]
+        if type(payload) is not str or type(stored_hash) is not str:
+            return None
+        try:
+            digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            notification = NotificationRequest.from_json(payload)
+        except (TypeError, ValueError, OverflowError, UnicodeError):
+            return None
+        if not stored_hash.isascii() or not hmac.compare_digest(digest, stored_hash):
+            return None
+        if (
+            notification.request_id != row["request_id"]
+            or notification.idempotency_key != row["idempotency_key"]
+            or notification.provider != row["provider"]
+        ):
+            return None
+        return notification
 
     @staticmethod
     def _begin(connection: sqlite3.Connection) -> None:
@@ -381,6 +427,21 @@ class SQLiteStore:
                 self._finish(connection, ok=True)
                 return None
             request_id = cast(str, row["request_id"])
+            notification = self._notification_from_row(row)
+            if notification is None:
+                connection.execute(
+                    """
+                    UPDATE notification_requests
+                    SET state = 'dead', next_attempt_at = NULL, lease_until = NULL,
+                        dead_at = ?, last_error_code = 'invalid_stored_payload',
+                        last_error_message = ?
+                    WHERE request_id = ?
+                    """,
+                    (now, _PERSISTED_FAILURES["invalid_stored_payload"], request_id),
+                )
+                ok = True
+                self._finish(connection, ok=True)
+                return None
             attempt_no = cast(int, row["attempt_count"]) + 1
             connection.execute(
                 """
@@ -397,10 +458,9 @@ class SQLiteStore:
                 """,
                 (request_id, attempt_no, now),
             )
-            payload = cast(str, row["payload_json"])
             ok = True
             self._finish(connection, ok=True)
-            return ClaimedRequest(NotificationRequest.from_json(payload), attempt_no)
+            return ClaimedRequest(notification, attempt_no)
         except Exception:
             if not ok and connection.in_transaction:
                 self._finish(connection, ok=False)

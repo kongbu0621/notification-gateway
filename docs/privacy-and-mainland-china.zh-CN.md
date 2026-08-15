@@ -43,12 +43,15 @@ SQLite durability 的目的，是投递已接受的任务，而不是建立永�
 - [《中华人民共和国网络安全法》（Cybersecurity Law，2026 年施行的现行文本）](https://www.cac.gov.cn/2025-12/29/c_1768735112911946.htm)：network operation 与 user information protection obligations。
 - [《网络数据安全管理条例》（Network Data Security Management Regulations）](https://www.cac.gov.cn/2024-09/30/c_1729384452307680.htm)：network data control、recipient/processor contract、privacy rule、individual request、audit、incident 与 cross-border management。
 - [《促进和规范数据跨境流动规定》（Provisions on Facilitating and Regulating Cross-Border Data Flows）](https://www.cac.gov.cn/2024-03/22/c_1712776611775634.htm)：security assessment、standard contract 与 certification 的现行豁免和数量 threshold。
+- [《个人信息出境认证办法》（Measures for Personal Information Export Certification）](https://www.cac.gov.cn/2025-10/17/c_1762449728720008.htm)：certification route 的适用条件、申请、认证、监督与 certificate requirements；自 2026 年 1 月 1 日起施行。
 - [《个人信息保护合规审计管理办法》（Measures for the Administration of Personal Information Protection Compliance Audits）](https://www.cac.gov.cn/2025-02/14/c_1741233507681519.htm)：periodic compliance audit、audit scope、professional institution 要求和监管部门要求的审计；自 2025 年 5 月 1 日起施行。
 - [《国家网络安全事件报告管理办法》（National Cybersecurity Incident Reporting Measures）](https://www.cac.gov.cn/2025-09/15/c_1759583017717009.htm)：中国大陆 network operator 的 incident classification、reporting channel、time limit、report content 与 follow-up obligations；自 2025 年 11 月 1 日起施行。
 
 处理至少 100 万人个人信息的运营者，还应评估个人信息保护负责人（Personal Information Protection Officer, PIPO）的指定与监管部门报送要求。该 threshold 取决于具体 deployment；本工程不假定每个运营者都达到门槛。参见[国家网信办报送公告（CAC reporting notice）](https://www.cac.gov.cn/2025-07/18/c_1754553420421538.htm)。
 
 在中国大陆基础设施上向 public Internet 提供服务，还可能需要 ICP 备案或其他许可，以及额外的 cybersecurity controls。本工程不会替运营者判断或取得这些 approval。
+
+以上列表并非穷尽。运营者还必须识别适用于具体 deployment 的 data-specific、sector-specific、recipient-specific 与 service-specific rules。征求意见稿（consultation draft）在正式通过并生效前，不在本文中作为现行 operative requirement。
 
 ## 部署检查清单（Deployment checklist）
 

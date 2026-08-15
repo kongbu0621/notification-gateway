@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeGuard, cast
 
 from .exceptions import ValidationError
 
@@ -42,6 +43,11 @@ _EXPECTED_FIELDS: Final = frozenset(
         "created_at",
     }
 )
+_JSON_PARSE_FAILED: Final = object()
+
+
+def _is_provider_name(value: object) -> TypeGuard[str]:
+    return type(value) is str and _PROVIDER.fullmatch(value) is not None
 
 
 def _reject_json_constant(constant: str) -> object:
@@ -60,10 +66,11 @@ def _parse_created_at(value: object) -> datetime:
     text = _require_string(value, "created_at")
     if not _UTC_TIMESTAMP.fullmatch(text):
         raise ValidationError("created_at must use canonical UTC RFC 3339 syntax")
-    try:
+    parsed = None
+    with suppress(ValueError):
         parsed = datetime.fromisoformat(text[:-1] + "+00:00")
-    except ValueError as error:
-        raise ValidationError("created_at must be a valid RFC 3339 timestamp") from error
+    if parsed is None:
+        raise ValidationError("created_at must be a valid RFC 3339 timestamp")
     if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
         raise ValidationError("created_at must be timezone-aware UTC")
     return parsed.astimezone(UTC)
@@ -105,11 +112,13 @@ def _copy_metadata(value: object) -> Mapping[str, Any]:
     if len(value) > MAX_METADATA_KEYS:
         raise ValidationError("metadata contains too many keys")
     _validate_json(value)
-    try:
+    encoded = None
+    encoded_bytes = None
+    with suppress(UnicodeEncodeError, ValueError):
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         encoded_bytes = encoded.encode("utf-8")
-    except (UnicodeEncodeError, ValueError) as error:
-        raise ValidationError("metadata is not safely JSON-serializable") from error
+    if encoded is None or encoded_bytes is None:
+        raise ValidationError("metadata is not safely JSON-serializable")
     if len(encoded_bytes) > MAX_METADATA_BYTES:
         raise ValidationError("metadata is too large")
     copied = cast(dict[str, Any], json.loads(encoded))
@@ -168,7 +177,7 @@ class NotificationRequest:
             self.idempotency_key
         ):
             raise ValidationError("idempotency_key has an invalid format")
-        if not _PROVIDER.fullmatch(self.provider):
+        if not _is_provider_name(self.provider):
             raise ValidationError("provider has an invalid format")
         if len(self.subject) > MAX_SUBJECT_CHARS:
             raise ValidationError("subject is too long")
@@ -182,10 +191,11 @@ class NotificationRequest:
             raise ValidationError("created_at must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "metadata", _copy_metadata(dict(self.metadata)))
-        try:
+        request_bytes = None
+        with suppress(UnicodeEncodeError, ValueError):
             request_bytes = self.to_json().encode("utf-8")
-        except (UnicodeEncodeError, ValueError) as error:
-            raise ValidationError("request is not safely JSON-serializable") from error
+        if request_bytes is None:
+            raise ValidationError("request is not safely JSON-serializable")
         if len(request_bytes) > MAX_REQUEST_BYTES:
             raise ValidationError("serialized request is too large")
 
@@ -200,7 +210,7 @@ class NotificationRequest:
         if missing:
             raise ValidationError(f"request is missing fields: {', '.join(sorted(missing))}")
         if extra:
-            raise ValidationError(f"request contains unknown fields: {', '.join(sorted(extra))}")
+            raise ValidationError("request contains unknown fields")
         severity = _require_string(value["severity"], "severity")
         if severity not in SEVERITIES:
             raise ValidationError("severity is invalid")
@@ -219,15 +229,19 @@ class NotificationRequest:
 
     @classmethod
     def from_json(cls, value: str) -> NotificationRequest:
+        parsed: object = _JSON_PARSE_FAILED
+        failure_message: str | None = None
         try:
-            parsed: object = json.loads(
+            parsed = json.loads(
                 value,
                 parse_constant=_reject_json_constant,
             )
         except RecursionError:
-            raise ValidationError("request JSON nesting is too deep") from None
-        except (json.JSONDecodeError, ValueError) as error:
-            raise ValidationError("request is not valid JSON") from error
+            failure_message = "request JSON nesting is too deep"
+        except (json.JSONDecodeError, ValueError):
+            failure_message = "request is not valid JSON"
+        if failure_message is not None or parsed is _JSON_PARSE_FAILED:
+            raise ValidationError(failure_message or "request is not valid JSON")
         return cls.from_dict(parsed)
 
     def to_dict(self) -> dict[str, Any]:

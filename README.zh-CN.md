@@ -113,6 +113,7 @@ Server 默认绑定 `127.0.0.1:8787`，提供以下 endpoint：
 - Provider I/O 不会在 SQLite write transaction 内执行。
 - Provider error text 与 provider-controlled error code 永不持久化；只保存 gateway-owned code 与 generic message。
 - Provider 返回的 message ID 与 details 仅存在于进程内，不写入 SQLite、log、status response 或 attempt evidence。
+- 在执行 Provider I/O 前，Worker 会校验持久化 payload hash，以及冗余保存的 request、idempotency 与 Provider identity。损坏或不一致的 record 会以 generic gateway-owned classification 进入 `dead`，绝不会被投递。
 
 ## 密钥与隐私（Secrets and privacy）
 

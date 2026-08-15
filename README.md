@@ -116,6 +116,9 @@ Non-loopback binding is refused unless `--allow-non-loopback` is explicit, and i
   codes and generic messages are stored.
 - Provider-returned message IDs and details remain in-process and are not written to SQLite, logs,
   status responses, or attempt evidence.
+- Before Provider I/O, the Worker verifies the persisted payload hash and its redundant request,
+  idempotency, and Provider identities. A corrupt or inconsistent record becomes `dead` with a
+  generic gateway-owned classification and is never delivered.
 
 ## Secrets and privacy
 

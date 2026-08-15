@@ -58,7 +58,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(count)
         return 0
-    gateway = _gateway(args.db)
     if args.command == "serve":
         try:
             loopback = ipaddress.ip_address(args.host).is_loopback
@@ -68,17 +67,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not loopback and not args.allow_non_loopback:
             print("refusing non-loopback bind without --allow-non-loopback", file=sys.stderr)
             return 2
-        if not loopback and not token:
-            print("non-loopback bind requires NOTIFICATION_GATEWAY_AUTH_TOKEN", file=sys.stderr)
+        if not loopback and (token is None or len(token) < 32):
+            print(
+                "non-loopback bind requires a 32-character NOTIFICATION_GATEWAY_AUTH_TOKEN",
+                file=sys.stderr,
+            )
             return 2
+        gateway = _gateway(args.db)
         app = GatewayWSGIApp(gateway, auth_token=token)
         with make_server(args.host, args.port, app) as server:
             server.serve_forever()
         return 0
     if args.command == "work-once":
-        if not gateway.providers:
+        if not os.environ.get("WECOM_WEBHOOK_URL"):
             print("WECOM_WEBHOOK_URL is required to deliver notifications", file=sys.stderr)
             return 2
+        gateway = _gateway(args.db)
         worker = DeliveryWorker(
             gateway,
             RetryPolicy(

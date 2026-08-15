@@ -6,6 +6,7 @@ import hmac
 import json
 import re
 from collections.abc import Callable
+from contextlib import suppress
 from http import HTTPStatus
 from typing import Any, Final, cast
 from urllib.parse import unquote
@@ -48,10 +49,14 @@ class GatewayWSGIApp:
     """WSGI application; an optional bearer token protects non-health routes."""
 
     def __init__(self, gateway: NotificationGateway, *, auth_token: str | None = None) -> None:
-        if auth_token is not None and len(auth_token) < 32:
+        auth_token_bytes = None
+        if type(auth_token) is str:
+            with suppress(UnicodeEncodeError):
+                auth_token_bytes = auth_token.encode("utf-8")
+        if auth_token is not None and (auth_token_bytes is None or len(auth_token) < 32):
             raise ValueError("auth_token must be at least 32 characters")
         self.gateway = gateway
-        self._auth_token = auth_token
+        self._auth_token = auth_token_bytes
 
     def __repr__(self) -> str:
         return f"GatewayWSGIApp(gateway={self.gateway!r}, auth_token=<redacted>)"
@@ -59,11 +64,14 @@ class GatewayWSGIApp:
     def _authorized(self, environ: dict[str, Any]) -> bool:
         if self._auth_token is None:
             return True
-        supplied = cast(str, environ.get("HTTP_AUTHORIZATION", ""))
+        supplied = environ.get("HTTP_AUTHORIZATION", "")
         prefix = "Bearer "
-        return supplied.startswith(prefix) and hmac.compare_digest(
-            supplied[len(prefix) :], self._auth_token
-        )
+        if type(supplied) is not str or not supplied.startswith(prefix):
+            return False
+        supplied_bytes = None
+        with suppress(UnicodeEncodeError):
+            supplied_bytes = supplied[len(prefix) :].encode("utf-8")
+        return supplied_bytes is not None and hmac.compare_digest(supplied_bytes, self._auth_token)
 
     def __call__(self, environ: dict[str, Any], start_response: StartResponse) -> list[bytes]:
         method = cast(str, environ.get("REQUEST_METHOD", "GET")).upper()
