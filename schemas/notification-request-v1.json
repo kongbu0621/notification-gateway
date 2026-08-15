@@ -1,9 +1,50 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.invalid/notification-gateway/schemas/notification-request-v1.json",
+  "$id": "https://github.com/kongbu0621/notification-gateway/schemas/notification-request-v1.json",
   "title": "NotificationRequest v1",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "scalar": {
+      "type": ["string", "number", "boolean", "null"]
+    },
+    "valueDepth4": {
+      "$ref": "#/$defs/scalar"
+    },
+    "valueDepth3": {
+      "anyOf": [
+        {"$ref": "#/$defs/scalar"},
+        {"type": "array", "items": {"$ref": "#/$defs/valueDepth4"}},
+        {
+          "type": "object",
+          "propertyNames": {"minLength": 1, "maxLength": 128},
+          "additionalProperties": {"$ref": "#/$defs/valueDepth4"}
+        }
+      ]
+    },
+    "valueDepth2": {
+      "anyOf": [
+        {"$ref": "#/$defs/scalar"},
+        {"type": "array", "items": {"$ref": "#/$defs/valueDepth3"}},
+        {
+          "type": "object",
+          "propertyNames": {"minLength": 1, "maxLength": 128},
+          "additionalProperties": {"$ref": "#/$defs/valueDepth3"}
+        }
+      ]
+    },
+    "valueDepth1": {
+      "anyOf": [
+        {"$ref": "#/$defs/scalar"},
+        {"type": "array", "items": {"$ref": "#/$defs/valueDepth2"}},
+        {
+          "type": "object",
+          "propertyNames": {"minLength": 1, "maxLength": 128},
+          "additionalProperties": {"$ref": "#/$defs/valueDepth2"}
+        }
+      ]
+    }
+  },
   "required": [
     "schema_version",
     "request_id",
@@ -33,18 +74,19 @@
       "pattern": "^[a-z][a-z0-9_-]{0,63}$"
     },
     "subject": {"type": "string", "maxLength": 128},
-    "title": {"type": "string", "minLength": 1, "maxLength": 256},
-    "body": {"type": "string", "minLength": 1, "maxLength": 16384},
+    "title": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
+    "body": {"type": "string", "minLength": 1, "maxLength": 16384, "pattern": "\\S"},
     "severity": {"enum": ["info", "warning", "error", "critical"]},
     "metadata": {
       "type": "object",
       "maxProperties": 32,
-      "propertyNames": {"minLength": 1, "maxLength": 128}
+      "propertyNames": {"minLength": 1, "maxLength": 128},
+      "additionalProperties": {"$ref": "#/$defs/valueDepth1"}
     },
     "created_at": {
       "type": "string",
       "format": "date-time",
-      "pattern": "Z$"
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"
     }
   }
 }

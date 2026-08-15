@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import math
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -53,6 +53,22 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     UNIQUE(request_id, attempt_no)
 );
 """
+_SCHEMA_VERSION: Final = 2
+_PERSISTED_FAILURES: Final = {
+    "unknown_provider": "configured provider is unavailable",
+    "provider_delivery_error": "provider reported a delivery failure",
+    "unexpected_provider_error": "provider raised an unexpected error",
+    "invalid_provider_result": "provider returned invalid delivery evidence",
+}
+
+
+def _is_finite_number(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)  # type: ignore[arg-type]
+    except OverflowError:
+        return False
 
 
 def _iso_or_none(value: object) -> str | None:
@@ -87,6 +103,7 @@ class SQLiteStore:
         connection = self._connect()
         try:
             connection.executescript(_SCHEMA)
+            self._migrate(connection)
         finally:
             if self._memory_connection is None:
                 connection.close()
@@ -98,6 +115,7 @@ class SQLiteStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA secure_delete = ON")
         if self.path != ":memory:":
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
@@ -107,6 +125,46 @@ class SQLiteStore:
         if self._memory_connection is not None:
             return self._memory_connection
         return self._new_connection()
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
+        if version >= _SCHEMA_VERSION:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            # v2 stops persisting provider-controlled delivery evidence. Redact
+            # legacy rows once so upgrading does not leave old secrets behind.
+            connection.execute(
+                """
+                UPDATE notification_requests
+                SET provider_message_id = NULL, provider_details_json = NULL,
+                    last_error_code = CASE WHEN last_error_code IS NULL THEN NULL
+                        ELSE 'legacy_error_redacted' END,
+                    last_error_message = NULL
+                """
+            )
+            connection.execute(
+                """
+                UPDATE delivery_attempts
+                SET provider_message_id = NULL, provider_details_json = NULL,
+                    error_code = CASE WHEN error_code IS NULL THEN NULL
+                        ELSE 'legacy_error_redacted' END,
+                    error_message = NULL
+                """
+            )
+            connection.execute("COMMIT")
+        except Exception:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        if connection.execute("PRAGMA database_list").fetchone()[2] != "":
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("VACUUM")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # Set the version only after physical cleanup succeeds. A failed
+        # checkpoint/VACUUM therefore retries the fail-closed migration later.
+        connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @staticmethod
     def _begin(connection: sqlite3.Connection) -> None:
@@ -130,6 +188,8 @@ class SQLiteStore:
         )
 
     def enqueue(self, notification: NotificationRequest, *, now: float) -> EnqueueResult:
+        if not _is_finite_number(now):
+            raise ValueError("now must be a finite number")
         payload = notification.to_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         connection = self._connect()
@@ -193,7 +253,16 @@ class SQLiteStore:
             if self._memory_connection is None:
                 connection.close()
 
-    def claim_due(self, *, now: float, lease_seconds: float) -> ClaimedRequest | None:
+    def claim_due(
+        self, *, now: float, lease_seconds: float, max_attempts: int = 5
+    ) -> ClaimedRequest | None:
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+        if (
+            not all(_is_finite_number(value) for value in (now, lease_seconds))
+            or lease_seconds <= 0
+        ):
+            raise ValueError("now and lease_seconds must be finite, with a positive lease")
         connection = self._connect()
         ok = False
         try:
@@ -201,9 +270,28 @@ class SQLiteStore:
             connection.execute(
                 """
                 UPDATE delivery_attempts
-                SET finished_at = ?, outcome = 'retry', retryable = 1,
-                    error_code = 'lease_expired',
-                    error_message = 'previous delivery lease expired'
+                SET finished_at = ?,
+                    outcome = CASE WHEN (
+                        SELECT request.attempt_count
+                        FROM notification_requests AS request
+                        WHERE request.request_id = delivery_attempts.request_id
+                    ) >= ? THEN 'dead' ELSE 'retry' END,
+                    retryable = CASE WHEN (
+                        SELECT request.attempt_count
+                        FROM notification_requests AS request
+                        WHERE request.request_id = delivery_attempts.request_id
+                    ) >= ? THEN 0 ELSE 1 END,
+                    error_code = CASE WHEN (
+                        SELECT request.attempt_count
+                        FROM notification_requests AS request
+                        WHERE request.request_id = delivery_attempts.request_id
+                    ) >= ? THEN 'lease_expired_exhausted' ELSE 'lease_expired' END,
+                    error_message = CASE WHEN (
+                        SELECT request.attempt_count
+                        FROM notification_requests AS request
+                        WHERE request.request_id = delivery_attempts.request_id
+                    ) >= ? THEN 'delivery attempts exhausted after lease expiry'
+                    ELSE 'previous delivery lease expired' END
                 WHERE outcome IS NULL AND EXISTS (
                     SELECT 1 FROM notification_requests AS request
                     WHERE request.request_id = delivery_attempts.request_id
@@ -211,26 +299,51 @@ class SQLiteStore:
                       AND request.lease_until <= ?
                 )
                 """,
-                (now, now),
+                (now, max_attempts, max_attempts, max_attempts, max_attempts, now),
             )
             connection.execute(
                 """
                 UPDATE notification_requests
-                SET state = 'retry', next_attempt_at = ?, lease_until = NULL,
-                    last_error_code = 'lease_expired',
-                    last_error_message = 'previous delivery lease expired'
+                SET state = CASE WHEN attempt_count >= ? THEN 'dead' ELSE 'retry' END,
+                    next_attempt_at = CASE WHEN attempt_count >= ? THEN NULL ELSE ? END,
+                    lease_until = NULL,
+                    dead_at = CASE WHEN attempt_count >= ? THEN ? ELSE NULL END,
+                    last_error_code = CASE WHEN attempt_count >= ?
+                        THEN 'lease_expired_exhausted' ELSE 'lease_expired' END,
+                    last_error_message = CASE WHEN attempt_count >= ?
+                        THEN 'delivery attempts exhausted after lease expiry'
+                        ELSE 'previous delivery lease expired' END
                 WHERE state = 'in_flight' AND lease_until <= ?
                 """,
-                (now, now),
+                (
+                    max_attempts,
+                    max_attempts,
+                    now,
+                    max_attempts,
+                    now,
+                    max_attempts,
+                    max_attempts,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE notification_requests
+                SET state = 'dead', next_attempt_at = NULL, lease_until = NULL,
+                    dead_at = ?, last_error_code = 'attempts_exhausted',
+                    last_error_message = 'delivery attempts exhausted'
+                WHERE state IN ('pending','retry') AND attempt_count >= ?
+                """,
+                (now, max_attempts),
             )
             row = connection.execute(
                 """
                 SELECT * FROM notification_requests
-                WHERE state IN ('pending','retry') AND next_attempt_at <= ?
+                WHERE state IN ('pending','retry') AND attempt_count < ? AND next_attempt_at <= ?
                 ORDER BY next_attempt_at, accepted_at, request_id
                 LIMIT 1
                 """,
-                (now,),
+                (max_attempts, now),
             ).fetchone()
             if row is None:
                 ok = True
@@ -273,7 +386,8 @@ class SQLiteStore:
         *,
         now: float,
     ) -> None:
-        details = json.dumps(dict(result.details), sort_keys=True, separators=(",", ":"))
+        if not _is_finite_number(now):
+            raise ValueError("now must be a finite number")
         connection = self._connect()
         try:
             self._begin(connection)
@@ -285,7 +399,7 @@ class SQLiteStore:
                     last_error_message = NULL, provider_message_id = ?, provider_details_json = ?
                 WHERE request_id = ? AND state = 'in_flight' AND attempt_count = ?
                 """,
-                (now, result.message_id, details, request_id, attempt_no),
+                (now, None, None, request_id, attempt_no),
             )
             if cursor.rowcount != 1:
                 raise RequestNotFoundError("active delivery attempt was not found")
@@ -296,7 +410,7 @@ class SQLiteStore:
                     provider_message_id = ?, provider_details_json = ?
                 WHERE request_id = ? AND attempt_no = ?
                 """,
-                (now, result.message_id, details, request_id, attempt_no),
+                (now, None, None, request_id, attempt_no),
             )
             self._finish(connection, ok=True)
         except Exception:
@@ -319,7 +433,16 @@ class SQLiteStore:
         now: float,
         retry_at: float | None,
     ) -> None:
+        if _PERSISTED_FAILURES.get(error_code) != error_message:
+            raise ValueError("failure code and message must be gateway-owned")
         terminal = exhausted or not retryable
+        if not _is_finite_number(now):
+            raise ValueError("now must be a finite number")
+        if terminal:
+            if retry_at is not None:
+                raise ValueError("terminal failures must not have a retry time")
+        elif not _is_finite_number(retry_at):
+            raise ValueError("retryable failures require a finite retry time")
         state = "dead" if terminal else "retry"
         outcome = "dead" if terminal else "retry"
         connection = self._connect()
@@ -376,8 +499,16 @@ class SQLiteStore:
         delivered_retention_seconds: float,
         dead_retention_seconds: float,
     ) -> int:
-        if delivered_retention_seconds < 0 or dead_retention_seconds < 0:
-            raise ValueError("retention durations must not be negative")
+        if (
+            not _is_finite_number(now)
+            or not all(
+                _is_finite_number(value)
+                for value in (delivered_retention_seconds, dead_retention_seconds)
+            )
+            or delivered_retention_seconds < 0
+            or dead_retention_seconds < 0
+        ):
+            raise ValueError("retention durations must be finite non-negative numbers")
         connection = self._connect()
         try:
             self._begin(connection)

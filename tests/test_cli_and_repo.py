@@ -27,6 +27,15 @@ def test_cli_refuses_unsafe_non_loopback_and_missing_provider(
     assert capsys.readouterr().out.strip() == "0"
 
 
+def test_purge_does_not_initialize_unrelated_provider(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv(
+        "WECOM_WEBHOOK_URL",
+        "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
+    )
+    assert main(["--db", str(tmp_path / "cli.sqlite3"), "purge"]) == 0
+    assert capsys.readouterr().out.strip() == "0"
+
+
 def test_cli_serves_loopback_and_runs_empty_worker(tmp_path: Path, monkeypatch) -> None:
     class FakeServer:
         served = False

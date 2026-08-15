@@ -111,7 +111,7 @@ class WeComWebhookProvider:
                 retryable=True,
                 code="wecom_invalid_response",
             ) from None
-        if not isinstance(response, dict) or not isinstance(response.get("errcode"), int):
+        if not isinstance(response, dict) or type(response.get("errcode")) is not int:
             raise DeliveryError(
                 "WeCom returned an invalid response",
                 retryable=True,

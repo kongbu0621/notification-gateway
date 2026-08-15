@@ -119,6 +119,9 @@ def test_http_content_type_length_routes_and_health(tmp_path: Path) -> None:
     assert call(service, "POST", "/v1/notifications", payload={}, content_length="999999")[
         0
     ].startswith("413")
+    assert call(service, "POST", "/v1/notifications", payload={}, content_length="3")[0].startswith(
+        "400"
+    )
 
 
 def test_http_bearer_auth_is_secret_safe(tmp_path: Path) -> None:

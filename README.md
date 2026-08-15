@@ -2,7 +2,7 @@
 
 `notification-gateway` is a small, typed Python service/library for durably accepting notification requests and delivering them through pluggable providers. v0.1 uses SQLite, an at-least-once worker, a minimal WSGI HTTP boundary, and a WeCom-compatible group-robot adapter.
 
-It owns request validation, durable intake, provider routing, bounded retry, restart recovery, status, retention cleanup, and secret-safe delivery evidence. It does not own caller-specific monitoring, scheduling, scraping, product workflow, recipient management, or business rules.
+It owns request validation, durable intake, provider routing, bounded retry, restart recovery, status, retention cleanup, and secret-safe delivery outcome accounting. It does not own caller-specific monitoring, scheduling, scraping, product workflow, recipient management, or business rules.
 
 ## Status
 
@@ -22,7 +22,7 @@ Python 3.11 or newer is required.
 
 ## Stable request contract
 
-The Python model and `schemas/notification-request-v1.json` define the same strict v1 fields:
+The Python model and `schemas/notification-request-v1.json` define the same strict v1 fields, canonical UTC timestamp syntax, and metadata shape/depth rules. The Python boundary additionally enforces UTF-8 byte limits that JSON Schema cannot express portably.
 
 ```json
 {
@@ -104,18 +104,20 @@ Non-loopback binding is refused unless `--allow-non-loopback` is explicit, and i
 ## Retry and restart behavior
 
 - Delivery is at-least-once.
-- Retry uses bounded exponential backoff with explicit maximum attempts and delay.
+- Retry uses bounded exponential backoff with explicit maximum attempts and delay, including attempts recovered after an expired crash lease.
 - Retry state and attempt evidence survive restart.
 - Expired in-flight leases become retryable work using the same request ID.
 - Permanent failures and exhausted retries become `dead`.
 - Provider I/O does not occur inside a SQLite write transaction.
-- Provider errors are normalized and bounded before persistence.
+- Provider error text and provider-controlled error codes are never persisted; only gateway-owned
+  codes and generic messages are stored. Provider-returned message IDs and details remain
+  in-process and are not written to SQLite, logs, status responses, or attempt evidence.
 
 ## Secrets and privacy
 
-Webhook URLs and authentication tokens come only from runtime configuration. Secret fields are excluded from object representations. Full URLs, query strings, headers, raw provider responses, and unsanitized provider exceptions must not appear in logs, HTTP errors, SQLite, attempts, fixtures, or audit evidence.
+Webhook URLs and authentication tokens come only from runtime configuration. Secret fields are excluded from object representations. Gateway- and provider-owned URLs, query strings, headers, identifiers, details, raw responses, error codes, and exception text must not appear in logs, HTTP errors, SQLite, attempts, fixtures, or audit evidence.
 
-Notification content and metadata may contain personal information if a caller supplies it. The gateway does not decide whether that processing is lawful. Callers/operators remain responsible for purpose limitation, data minimization, lawful basis, notices/consents, sensitive and minor data, retention, deletion, individual rights, provider contracts, and cross-border transfer rules.
+Notification content and metadata are opaque caller data. They are durably persisted and forwarded, and the gateway cannot reliably detect whether they contain a password, token, URL, personal information, or other sensitive material. The gateway does not decide whether that processing is lawful. Callers/operators remain responsible for purpose limitation, data minimization, lawful basis, notices/consents, sensitive and minor data, retention, deletion, individual rights, provider contracts, and cross-border transfer rules.
 
 Prefer generic content plus an opaque event reference. Never put passwords, tokens, recovery codes, identity-document numbers, financial credentials, unrestricted student profiles, or other unnecessary personal information in notification requests.
 
@@ -127,7 +129,7 @@ SQLite durability is not a permanent message archive. `purge_terminal` removes d
 
 ## Add a provider
 
-A provider implements a stable `name` and `deliver(NotificationRequest) -> DeliveryResult`. Provider transport must be injectable so tests never use external services. A provider must document its operator, expected data region when known, possible cross-border transfer, accepted data classification, size limits, retry semantics, and approval requirements.
+A provider implements a stable `name` and `deliver(NotificationRequest) -> DeliveryResult`. Provider transport must be injectable so tests never use external services. `DeliveryError` always renders generic text; its code and retryability are in-process controls only. Delivery-result message IDs and details are opaque, excluded from representations, and never validated, serialized, logged, or persisted by the worker; only the matching provider name controls success. The worker persists gateway-owned outcome, retryability, and generic failure classifications. A provider must document its operator, expected data region when known, possible cross-border transfer, accepted data classification, size limits, retry semantics, and approval requirements.
 
 No provider should claim that data remains in a jurisdiction based only on a hostname.
 

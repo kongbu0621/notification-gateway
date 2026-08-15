@@ -6,6 +6,8 @@ This document is engineering guidance, not legal certification or legal advice. 
 
 Publishing generic source code does not by itself mean that the repository processes end-user personal information. Operating the HTTP service, persisting requests, or delivering messages can do so when caller-supplied subject, title, body, metadata, identifiers, or provider evidence relates to an identified or identifiable person.
 
+Caller-supplied notification fields are opaque and are persisted for durable delivery. The gateway does not reliably detect passwords, tokens, URLs, personal information, or other sensitive material embedded in those fields. Secret-safety guarantees for provider credentials and transport evidence do not convert caller content into safe or lawful data.
+
 Keep repository history free of real credentials, personal email addresses, notification payloads, databases, logs, local paths, screenshots, and external task-sharing links. Contributors should use a GitHub-provided `users.noreply.github.com` commit address when they do not intend to publish an email address.
 
 ## Data minimization
@@ -37,6 +39,10 @@ Depending on the deployment and data, operators should evaluate at least:
 - [Cybersecurity Law, current text effective in 2026](https://www.cac.gov.cn/2025-12/29/c_1768735112911946.htm): network-operation and user-information protection obligations.
 - [Network Data Security Management Regulations](https://www.cac.gov.cn/2024-09/30/c_1729384452307680.htm): network-data controls, recipient/processor contracts, privacy rules, individual requests, audits, incidents, and cross-border management.
 - [Provisions on Facilitating and Regulating Cross-Border Data Flows](https://www.cac.gov.cn/2024-03/22/c_1712776611775634.htm): current exemptions and thresholds for security assessment, standard contracts, and certification.
+- [Measures for the Administration of Personal Information Protection Compliance Audits](https://www.cac.gov.cn/2025-02/14/c_1741233507681519.htm): periodic compliance audits, audit scope, professional-institution requirements, and regulator-directed audits; effective May 1, 2025.
+- [National Cybersecurity Incident Reporting Measures](https://www.cac.gov.cn/2025-09/15/c_1759583017717009.htm): incident classification, reporting channels, timing, content, and follow-up duties for network operators in mainland China; effective November 1, 2025.
+
+Operators processing personal information of at least one million people should also evaluate the personal-information-protection-officer appointment and regulator reporting requirements. The threshold is deployment-specific; the project does not assume that every operator reaches it. See the [CAC reporting notice](https://www.cac.gov.cn/2025-07/18/c_1754553420421538.htm).
 
 Public Internet operation from mainland-China infrastructure may also require ICP filing or another license and additional cybersecurity controls. The project does not determine or obtain those approvals for an operator.
 

@@ -7,7 +7,7 @@ These rules are part of the v0.1 contract and apply to humans and coding agents.
 3. Delivery is at-least-once. Never claim exactly-once behavior.
 4. Provider network I/O must never run inside a SQLite write transaction.
 5. Pending or retryable work may not be silently deleted, downgraded, or acknowledged as delivered.
-6. Webhook URLs, tokens, headers, raw provider responses, and secret-bearing exception chains must never enter repr output, logs, HTTP responses, SQLite, fixtures, audit evidence, or Git history.
+6. Runtime gateway- or provider-owned webhook URLs, tokens, headers, raw responses, identifiers, details, and secret-bearing exception chains must never enter repr output, logs, HTTP responses, SQLite, fixtures, audit evidence, or Git history. Tests may use unmistakably dummy values under invariant 12. Caller-supplied notification content is opaque, is durably persisted, and is governed by invariant 14.
 7. Persisted errors are normalized, bounded, and secret-safe. Unexpected provider exceptions use a generic error.
 8. Status projections exclude notification subject, title, body, metadata, and provider credentials.
 9. Runtime databases, WALs, logs, backups, and `.env` files are never committed.

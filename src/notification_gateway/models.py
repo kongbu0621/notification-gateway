@@ -27,6 +27,7 @@ SEVERITIES: Final = frozenset({"info", "warning", "error", "critical"})
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _PROVIDER = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _IDEMPOTENCY_KEY = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+_UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 _EXPECTED_FIELDS: Final = frozenset(
     {
         "schema_version",
@@ -43,6 +44,10 @@ _EXPECTED_FIELDS: Final = frozenset(
 )
 
 
+def _reject_json_constant(constant: str) -> object:
+    raise ValueError(f"non-standard JSON constant: {constant}")
+
+
 def _require_string(value: object, name: str, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ValidationError(f"{name} must be a string")
@@ -53,8 +58,8 @@ def _require_string(value: object, name: str, *, allow_empty: bool = False) -> s
 
 def _parse_created_at(value: object) -> datetime:
     text = _require_string(value, "created_at")
-    if not text.endswith("Z"):
-        raise ValidationError("created_at must be UTC and end in Z")
+    if not _UTC_TIMESTAMP.fullmatch(text):
+        raise ValidationError("created_at must use canonical UTC RFC 3339 syntax")
     try:
         parsed = datetime.fromisoformat(text[:-1] + "+00:00")
     except ValueError as error:
@@ -76,10 +81,14 @@ def _validate_json(value: object, *, depth: int = 0) -> None:
             raise ValidationError("metadata contains a non-finite number")
         return
     if isinstance(value, list):
+        if depth >= MAX_METADATA_DEPTH:
+            raise ValidationError("metadata exceeds the maximum nesting depth")
         for item in value:
             _validate_json(item, depth=depth + 1)
         return
     if isinstance(value, dict):
+        if depth >= MAX_METADATA_DEPTH:
+            raise ValidationError("metadata exceeds the maximum nesting depth")
         for key, item in value.items():
             if not isinstance(key, str) or not key or len(key) > 128:
                 raise ValidationError(
@@ -96,11 +105,37 @@ def _copy_metadata(value: object) -> Mapping[str, Any]:
     if len(value) > MAX_METADATA_KEYS:
         raise ValidationError("metadata contains too many keys")
     _validate_json(value)
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        encoded_bytes = encoded.encode("utf-8")
+    except (UnicodeEncodeError, ValueError) as error:
+        raise ValidationError("metadata is not safely JSON-serializable") from error
+    if len(encoded_bytes) > MAX_METADATA_BYTES:
         raise ValidationError("metadata is too large")
     copied = cast(dict[str, Any], json.loads(encoded))
-    return MappingProxyType(copied)
+    return cast(Mapping[str, Any], _freeze_json(copied))
+
+
+def _metadata_object(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("metadata must be an object")
+    return cast(Mapping[str, Any], value)
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 def _utc_text(value: datetime) -> str:
@@ -147,7 +182,11 @@ class NotificationRequest:
             raise ValidationError("created_at must be timezone-aware")
         object.__setattr__(self, "created_at", self.created_at.astimezone(UTC))
         object.__setattr__(self, "metadata", _copy_metadata(dict(self.metadata)))
-        if len(self.to_json().encode("utf-8")) > MAX_REQUEST_BYTES:
+        try:
+            request_bytes = self.to_json().encode("utf-8")
+        except (UnicodeEncodeError, ValueError) as error:
+            raise ValidationError("request is not safely JSON-serializable") from error
+        if len(request_bytes) > MAX_REQUEST_BYTES:
             raise ValidationError("serialized request is too large")
 
     @classmethod
@@ -174,15 +213,18 @@ class NotificationRequest:
             title=_require_string(value["title"], "title"),
             body=_require_string(value["body"], "body"),
             severity=cast(Severity, severity),
-            metadata=_copy_metadata(value["metadata"]),
+            metadata=_metadata_object(value["metadata"]),
             created_at=_parse_created_at(value["created_at"]),
         )
 
     @classmethod
     def from_json(cls, value: str) -> NotificationRequest:
         try:
-            parsed: object = json.loads(value)
-        except json.JSONDecodeError as error:
+            parsed: object = json.loads(
+                value,
+                parse_constant=_reject_json_constant,
+            )
+        except (json.JSONDecodeError, ValueError) as error:
             raise ValidationError("request is not valid JSON") from error
         return cls.from_dict(parsed)
 
@@ -196,7 +238,7 @@ class NotificationRequest:
             "title": self.title,
             "body": self.body,
             "severity": self.severity,
-            "metadata": dict(self.metadata),
+            "metadata": _thaw_json(self.metadata),
             "created_at": _utc_text(self.created_at),
         }
 
@@ -206,14 +248,11 @@ class NotificationRequest:
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
-    """Secret-safe evidence returned after successful provider delivery."""
+    """Opaque in-process result; provider evidence is never persisted or rendered."""
 
-    provider: str
+    provider: str = field(repr=False)
     message_id: str | None = field(default=None, repr=False)
-    details: Mapping[str, str | int | bool | None] = field(default_factory=dict, repr=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "details", MappingProxyType(dict(self.details)))
+    details: Mapping[str, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True, slots=True)

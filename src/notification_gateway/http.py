@@ -105,12 +105,11 @@ class GatewayWSGIApp:
         if stream is None or not hasattr(stream, "read"):
             return _response(start_response, HTTPStatus.BAD_REQUEST, {"error": "missing_body"})
         raw = cast(Any, stream).read(length)
-        if not isinstance(raw, bytes) or not raw:
+        if not isinstance(raw, bytes) or not raw or len(raw) != length:
             return _response(start_response, HTTPStatus.BAD_REQUEST, {"error": "missing_body"})
         try:
             decoded = raw.decode("utf-8")
-            value: object = json.loads(decoded)
-            notification = NotificationRequest.from_dict(value)
+            notification = NotificationRequest.from_json(decoded)
             result = self.gateway.accept(notification)
         except (UnicodeDecodeError, json.JSONDecodeError, ValidationError) as error:
             message = (
