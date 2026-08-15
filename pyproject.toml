@@ -50,6 +50,7 @@ include = [
   "/README.md",
   "/README.zh-CN.md",
   "/AGENTS.md",
+  "/AGENTS.zh-CN.md",
   "/SECURITY.md",
   "/SECURITY.zh-CN.md",
   "/LICENSE",
