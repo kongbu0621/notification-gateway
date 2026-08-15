@@ -224,6 +224,8 @@ class NotificationRequest:
                 value,
                 parse_constant=_reject_json_constant,
             )
+        except RecursionError:
+            raise ValidationError("request JSON nesting is too deep") from None
         except (json.JSONDecodeError, ValueError) as error:
             raise ValidationError("request is not valid JSON") from error
         return cls.from_dict(parsed)

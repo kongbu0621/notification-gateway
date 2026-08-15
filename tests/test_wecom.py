@@ -62,9 +62,17 @@ def test_rejects_invalid_webhooks(url: str) -> None:
         WeComWebhookProvider(url)
 
 
-def test_rejects_invalid_timeout_and_oversized_content() -> None:
+@pytest.mark.parametrize(
+    "timeout",
+    [0, float("nan"), float("inf"), True, 10**5000, "10"],
+    ids=["zero", "nan", "infinity", "boolean", "huge-integer", "string"],
+)
+def test_rejects_invalid_timeout(timeout: object) -> None:
     with pytest.raises(ConfigurationError, match="timeout"):
-        WeComWebhookProvider(URL, timeout=0)
+        WeComWebhookProvider(URL, timeout=timeout)  # type: ignore[arg-type]
+
+
+def test_rejects_oversized_content() -> None:
     provider = WeComWebhookProvider(URL, transport=StubTransport())
     with pytest.raises(DeliveryError) as raised:
         provider.deliver(make_request(provider="wecom", body="界" * 2000))
@@ -93,6 +101,21 @@ def test_invalid_provider_responses_are_normalized(response: bytes) -> None:
         provider.deliver(make_request(provider="wecom"))
     assert raised.value.retryable is True
     assert response.decode(errors="ignore") not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        ("[" * 10_000 + "0" + "]" * 10_000).encode(),
+        ('{"errcode":' + "9" * 5_000 + "}").encode(),
+    ],
+)
+def test_pathological_provider_json_is_normalized(response: bytes) -> None:
+    provider = WeComWebhookProvider(URL, transport=StubTransport(response=response))
+    with pytest.raises(DeliveryError) as raised:
+        provider.deliver(make_request(provider="wecom"))
+    assert raised.value.code == "wecom_invalid_response"
+    assert raised.value.__cause__ is None
 
 
 def test_api_error_does_not_echo_provider_message() -> None:

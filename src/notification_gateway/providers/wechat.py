@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import TIMEOUT_MAX
 from typing import Any, Final
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlparse
@@ -69,8 +71,15 @@ class WeComWebhookProvider:
             or not query[0][1].strip()
         ):
             raise ConfigurationError("invalid WeCom webhook URL")
-        if self.timeout <= 0:
-            raise ConfigurationError("timeout must be greater than zero")
+        if type(self.timeout) not in {int, float}:
+            raise ConfigurationError("timeout must be a finite supported number")
+        try:
+            timeout = float(self.timeout)
+        except OverflowError:
+            raise ConfigurationError("timeout must be a finite supported number") from None
+        if not math.isfinite(timeout) or not 0 < timeout <= TIMEOUT_MAX:
+            raise ConfigurationError("timeout must be a finite supported number")
+        self.timeout = timeout
 
     @property
     def name(self) -> str:
@@ -105,7 +114,7 @@ class WeComWebhookProvider:
             )
         try:
             response: Any = json.loads(response_body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise DeliveryError(
                 "WeCom returned an invalid response",
                 retryable=True,

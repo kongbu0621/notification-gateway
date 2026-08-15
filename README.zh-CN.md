@@ -108,7 +108,7 @@ Server 默认绑定 `127.0.0.1:8787`，提供以下 endpoint：
 - Delivery 采用 at-least-once 语义。
 - retry 使用 bounded exponential backoff，并显式限制最大 attempts 与 delay；crash lease 过期后恢复出的 attempt 也计入上限。
 - retry state 与 attempt evidence 在重启后仍然保留。
-- 过期的 in-flight lease 会使用同一个 request ID 恢复为 retryable work。
+- 当 attempt budget 尚未耗尽时，过期的 in-flight lease 会使用同一个 request ID 恢复为 retryable work；否则进入 `dead`。
 - permanent failure 或 attempts exhausted 会进入 `dead` 状态。
 - Provider I/O 不会在 SQLite write transaction 内执行。
 - Provider error text 与 provider-controlled error code 永不持久化；只保存 gateway-owned code 与 generic message。

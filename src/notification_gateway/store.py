@@ -7,11 +7,11 @@ import math
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, cast
 
-from .exceptions import ConflictError, RequestNotFoundError
+from .exceptions import ConfigurationError, ConflictError, RequestNotFoundError
 from .models import DeliveryResult, NotificationRequest, RequestStatus
 
 _SCHEMA: Final = """
@@ -60,6 +60,7 @@ _PERSISTED_FAILURES: Final = {
     "unexpected_provider_error": "provider raised an unexpected error",
     "invalid_provider_result": "provider returned invalid delivery evidence",
 }
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -71,10 +72,41 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
+def _timestamp_datetime(value: float) -> datetime:
+    return _EPOCH + timedelta(seconds=value)
+
+
+def _require_timestamp(value: object, name: str) -> float:
+    if not _is_finite_number(value):
+        raise ValueError(f"{name} must be a finite, representable Unix timestamp")
+    normalized = float(cast(int | float, value))
+    try:
+        _timestamp_datetime(normalized)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{name} must be a finite, representable Unix timestamp") from None
+    return normalized
+
+
+def _require_duration(value: object, name: str, *, positive: bool) -> float:
+    if not _is_finite_number(value):
+        raise ValueError(f"{name} must be a finite number")
+    normalized = float(cast(int | float, value))
+    invalid = normalized <= 0 if positive else normalized < 0
+    if invalid:
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return normalized
+
+
+def _add_timestamp(timestamp: float, duration: float, name: str) -> float:
+    return _require_timestamp(timestamp + duration, name)
+
+
 def _iso_or_none(value: object) -> str | None:
     if value is None:
         return None
-    return datetime.fromtimestamp(float(cast(float, value)), UTC).isoformat().replace("+00:00", "Z")
+    timestamp = _require_timestamp(value, "stored timestamp")
+    return _timestamp_datetime(timestamp).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +161,9 @@ class SQLiteStore:
     @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
         version = cast(int, connection.execute("PRAGMA user_version").fetchone()[0])
-        if version >= _SCHEMA_VERSION:
+        if version > _SCHEMA_VERSION:
+            raise ConfigurationError("database schema version is newer than supported")
+        if version == _SCHEMA_VERSION:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -188,8 +222,7 @@ class SQLiteStore:
         )
 
     def enqueue(self, notification: NotificationRequest, *, now: float) -> EnqueueResult:
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         payload = notification.to_json()
         digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         connection = self._connect()
@@ -258,11 +291,9 @@ class SQLiteStore:
     ) -> ClaimedRequest | None:
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be at least one")
-        if (
-            not all(_is_finite_number(value) for value in (now, lease_seconds))
-            or lease_seconds <= 0
-        ):
-            raise ValueError("now and lease_seconds must be finite, with a positive lease")
+        now = _require_timestamp(now, "now")
+        lease_seconds = _require_duration(lease_seconds, "lease_seconds", positive=True)
+        lease_until = _add_timestamp(now, lease_seconds, "lease deadline")
         connection = self._connect()
         ok = False
         try:
@@ -357,7 +388,7 @@ class SQLiteStore:
                 SET state = 'in_flight', attempt_count = ?, lease_until = ?, next_attempt_at = NULL
                 WHERE request_id = ?
                 """,
-                (attempt_no, now + lease_seconds, request_id),
+                (attempt_no, lease_until, request_id),
             )
             connection.execute(
                 """
@@ -386,8 +417,7 @@ class SQLiteStore:
         *,
         now: float,
     ) -> None:
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         connection = self._connect()
         try:
             self._begin(connection)
@@ -436,13 +466,14 @@ class SQLiteStore:
         if _PERSISTED_FAILURES.get(error_code) != error_message:
             raise ValueError("failure code and message must be gateway-owned")
         terminal = exhausted or not retryable
-        if not _is_finite_number(now):
-            raise ValueError("now must be a finite number")
+        now = _require_timestamp(now, "now")
         if terminal:
             if retry_at is not None:
                 raise ValueError("terminal failures must not have a retry time")
-        elif not _is_finite_number(retry_at):
-            raise ValueError("retryable failures require a finite retry time")
+        elif retry_at is None:
+            raise ValueError("retryable failures require a finite, representable retry time")
+        else:
+            retry_at = _require_timestamp(retry_at, "retry time")
         state = "dead" if terminal else "retry"
         outcome = "dead" if terminal else "retry"
         connection = self._connect()
@@ -499,16 +530,13 @@ class SQLiteStore:
         delivered_retention_seconds: float,
         dead_retention_seconds: float,
     ) -> int:
-        if (
-            not _is_finite_number(now)
-            or not all(
-                _is_finite_number(value)
-                for value in (delivered_retention_seconds, dead_retention_seconds)
-            )
-            or delivered_retention_seconds < 0
-            or dead_retention_seconds < 0
-        ):
-            raise ValueError("retention durations must be finite non-negative numbers")
+        now = _require_timestamp(now, "now")
+        delivered_retention_seconds = _require_duration(
+            delivered_retention_seconds, "delivered retention", positive=False
+        )
+        dead_retention_seconds = _require_duration(
+            dead_retention_seconds, "dead retention", positive=False
+        )
         connection = self._connect()
         try:
             self._begin(connection)

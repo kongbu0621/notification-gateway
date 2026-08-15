@@ -107,6 +107,8 @@ def test_from_dict_is_strict_and_requires_json_types() -> None:
     )
     with pytest.raises(ValidationError, match="valid JSON"):
         NotificationRequest.from_json(non_standard)
+    with pytest.raises(ValidationError, match="nesting is too deep"):
+        NotificationRequest.from_json("[" * 10_000 + "0" + "]" * 10_000)
 
 
 def test_created_at_requires_z_but_constructor_normalizes_utc() -> None:

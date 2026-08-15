@@ -108,12 +108,14 @@ Non-loopback binding is refused unless `--allow-non-loopback` is explicit, and i
 - Delivery is at-least-once.
 - Retry uses bounded exponential backoff with explicit maximum attempts and delay, including attempts recovered after an expired crash lease.
 - Retry state and attempt evidence survive restart.
-- Expired in-flight leases become retryable work using the same request ID.
+- Expired in-flight leases become retryable work using the same request ID while attempt budget
+  remains; otherwise they become `dead`.
 - Permanent failures and exhausted retries become `dead`.
 - Provider I/O does not occur inside a SQLite write transaction.
 - Provider error text and provider-controlled error codes are never persisted; only gateway-owned
-  codes and generic messages are stored. Provider-returned message IDs and details remain
-  in-process and are not written to SQLite, logs, status responses, or attempt evidence.
+  codes and generic messages are stored.
+- Provider-returned message IDs and details remain in-process and are not written to SQLite, logs,
+  status responses, or attempt evidence.
 
 ## Secrets and privacy
 

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from types import TracebackType
 
@@ -120,7 +121,24 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
         assert f"]({english_path.name})" in chinese
         assert re.search(r"[\u4e00-\u9fff]", chinese)
         assert english.count("\n## ") == chinese.count("\n## ")
-        assert english.count("```") == chinese.count("```")
+        assert len(re.findall(r"(?m)^- ", english)) == len(re.findall(r"(?m)^- ", chinese))
+        assert len(re.findall(r"(?m)^\d+\. ", english)) == len(re.findall(r"(?m)^\d+\. ", chinese))
+        assert re.findall(r"```[^\n]*\n(.*?)```", english, re.DOTALL) == re.findall(
+            r"```[^\n]*\n(.*?)```", chinese, re.DOTALL
+        )
+        external_pattern = r"\]\((https?://[^)]+)\)"
+        assert set(re.findall(external_pattern, english)) == set(
+            re.findall(external_pattern, chinese)
+        )
+
+        for document_path, content in ((english_path, english), (chinese_path, chinese)):
+            for target in re.findall(r"\]\(([^)]+)\)", content):
+                if target.startswith(("http://", "https://", "#")):
+                    continue
+                local_target = target.split("#", 1)[0]
+                assert (document_path.parent / local_target).is_file(), (
+                    f"broken local link {target!r} in {document_path}"
+                )
 
     chinese_readme = Path("README.zh-CN.md").read_text(encoding="utf-8")
     for term in (
@@ -139,6 +157,11 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
     assert len(re.findall(r"(?m)^\d+\. ", chinese_invariants)) == 16
     for term in ("at-least-once", "exactly-once", "SQLite", "WAL", "CI"):
         assert term in chinese_invariants
+
+    build_config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    sdist_includes = build_config["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    assert "/*.md" in sdist_includes
+    assert "/**/*.md" in sdist_includes
 
 
 def test_tracked_files_do_not_contain_external_task_links_or_real_secrets() -> None:

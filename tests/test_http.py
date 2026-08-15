@@ -32,11 +32,16 @@ def call(
     path: str,
     *,
     payload: object | None = None,
+    raw_payload: bytes | None = None,
     content_type: str = "application/json",
     token: str | None = None,
     content_length: str | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
-    raw = b"" if payload is None else json.dumps(payload).encode()
+    raw = (
+        raw_payload
+        if raw_payload is not None
+        else (b"" if payload is None else json.dumps(payload).encode())
+    )
     environ: dict[str, Any] = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
@@ -104,6 +109,13 @@ def test_http_conflict_unknown_provider_and_not_found(tmp_path: Path) -> None:
 )
 def test_http_rejects_invalid_requests(tmp_path: Path, payload: object | None) -> None:
     assert call(app(tmp_path), "POST", "/v1/notifications", payload=payload)[0].startswith("400")
+
+
+def test_http_rejects_deep_json_without_internal_error(tmp_path: Path) -> None:
+    raw = ("[" * 10_000 + "0" + "]" * 10_000).encode()
+    status, _, body = call(app(tmp_path), "POST", "/v1/notifications", raw_payload=raw)
+    assert status.startswith("400")
+    assert body["error"] == "invalid_request"
 
 
 def test_http_content_type_length_routes_and_health(tmp_path: Path) -> None:
