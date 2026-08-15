@@ -163,6 +163,11 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
         "Reuse this module when:",
         "Do not use this module when:",
         "a direct Webhook call is sufficient",
+        "At-least-once, not exactly-once",
+        "`serve` only accepts requests and returns status",
+        "does not encrypt notification content at the application layer",
+        "WeCom only",
+        "cannot atomically join the producer's business-database transaction",
     ):
         assert phrase in english_readme
     for phrase in (
@@ -170,6 +175,11 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
         "以下情况适合复用本模块：",
         "以下情况不需要使用本模块：",
         "直接调用 Webhook 已经足够",
+        "At-least-once，不是 exactly-once",
+        "`serve` 只负责接收 request 和返回 status",
+        "不会在 application layer 加密 notification content",
+        "目前只有 WeCom",
+        "无法与 Producer 的 business-database transaction 进行 atomic commit",
     ):
         assert phrase in chinese_readme
     for term in (
