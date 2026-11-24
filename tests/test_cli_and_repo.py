@@ -112,6 +112,40 @@ def test_repository_ignores_runtime_and_contains_public_safety_docs() -> None:
     assert Path("docs/privacy-and-mainland-china.zh-CN.md").is_file()
 
 
+def _documentation_code_blocks(content: str) -> list[tuple[str, str]]:
+    blocks = re.findall(r"```([^\n]*)\n(.*?)```", content, re.DOTALL)
+    # Translate only quoted rectangle/edge labels in the flowcharts. Preserve
+    # node IDs, directed edges, styles, renderer configuration and other code.
+    label_pattern = r'(?<=\[)"(?:[^"\\\n]|\\.)*"(?=\])|(?<=\|)"(?:[^"\\\n]|\\.)*"(?=\|)'
+    return [
+        (language, re.sub(label_pattern, '""', body) if language == "mermaid" else body)
+        for language, body in blocks
+    ]
+
+
+def test_documentation_diagrams_allow_translation_but_preserve_structure() -> None:
+    english = (
+        '```mermaid\nflowchart TD\nA["Implemented"]\nB["Result"]\n'
+        'A -->|"Read status"| B\nclass A built\n```\n'
+        '```python\nvalue = ["literal"]\n```'
+    )
+    chinese = english.replace("Implemented", "已实现").replace("Result", "结果")
+    chinese = chinese.replace("Read status", "读取状态")
+    expected = _documentation_code_blocks(english)
+    assert _documentation_code_blocks(chinese) == expected
+    for before, after in (
+        ("A -->", "B -->"),
+        ("-->", "-.->"),
+        ("A built", "A pending"),
+        ('B["结果"]\n', ""),
+        ("flowchart TD", "flowchart LR"),
+        ("literal", "translated-code"),
+        ("```python", "```bash"),
+    ):
+        assert before in chinese
+        assert _documentation_code_blocks(chinese.replace(before, after)) != expected
+
+
 def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> None:
     git = shutil.which("git")
     assert git is not None
@@ -139,9 +173,7 @@ def test_public_documentation_has_reciprocal_english_and_chinese_versions() -> N
         assert english.count("\n## ") == chinese.count("\n## ")
         assert len(re.findall(r"(?m)^- ", english)) == len(re.findall(r"(?m)^- ", chinese))
         assert len(re.findall(r"(?m)^\d+\. ", english)) == len(re.findall(r"(?m)^\d+\. ", chinese))
-        assert re.findall(r"```[^\n]*\n(.*?)```", english, re.DOTALL) == re.findall(
-            r"```[^\n]*\n(.*?)```", chinese, re.DOTALL
-        )
+        assert _documentation_code_blocks(english) == _documentation_code_blocks(chinese)
         external_pattern = r"\]\((https?://[^)]+)\)"
         assert set(re.findall(external_pattern, english)) == set(
             re.findall(external_pattern, chinese)
