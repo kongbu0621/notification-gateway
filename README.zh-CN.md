@@ -10,15 +10,46 @@
 
 应当把 `notification-gateway` 放在“产生重要 event 的应用”和“真正发送消息的 Provider”之间。应用直接调用 Webhook 时，如果 network、Provider 临时失败，或者应用在不恰当的时刻停止，通知可能静默丢失。本模块成功接受 notification 后，如果 acknowledgement 是否成功不明确，caller 可以安全重放完全相同的 request；durable record 随后通过 retry 与 restart recovery 完成投递。
 
-```text
-event producer (monitor / business service / agent)
-        |
-        v
-notification-gateway
-  accept -> SQLite -> Worker -> Provider (WeCom today)
-              |          |
-              +-- retry / restart recovery --+
+完整设计如下。**已实现**为 v0.1 alpha 的代码能力；黄色虚线框是按需扩展、**待实现**的新 Provider；灰色节点由调用方、运营者或 Provider 负责。持久接纳和实际投递是分开的阶段，`serve` 本身不驱动 Worker。
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 240}}}%%
+flowchart TD
+    A["调用方 · 产生通知事件<br/>稳定 request_id 与完整请求<br/>结果不明时重放同一请求"]
+    I["已实现 · Python / HTTP Intake<br/>校验请求与幂等冲突"]
+    Q["已实现 · SQLite 持久接纳<br/>先提交请求，再返回接纳回执<br/>不与调用方业务库跨库原子提交"]
+    W["已实现 · DeliveryWorker<br/>校验持久载荷并以租约认领<br/>Provider I/O 在写事务外"]
+    O["运营者 · Supervisor / Scheduler<br/>反复驱动 work-once<br/>显式执行保留与清理策略"]
+    P["已实现 · WeCom Adapter<br/>调用已配置的 Provider"]
+    X["待实现 · 按需新增 Provider<br/>通过 deliver 协议接入<br/>没有动态插件发现系统"]
+    R["已实现 · 结果持久化与恢复<br/>delivered / 有界退避 retry / dead<br/>过期租约按原 request_id 恢复"]
+    H["已实现 · 状态与终态清理<br/>状态不含通知内容<br/>purge 保留 pending / retryable 工作"]
+    U["调用方取得接纳与投递状态<br/>按实际失败继续处理<br/>Provider 接受不证明收件人已读"]
+    A --> I
+    I --> Q
+    Q -->|"接纳回执"| U
+    Q -->|"到期工作"| W
+    O -->|"驱动投递"| W
+    W --> P
+    W -.->|"未来注册相应实现"| X
+    P -->|"结果或异常"| R
+    X -.->|"相同结果合同"| R
+    R -->|"预算内重试"| W
+    R --> H
+    O -->|"显式保留期限"| H
+    H -->|"查询状态"| U
+    class I,Q,W,P,R,H built
+    class X pending
+    class A,O external
+    class U outcome
+    classDef built fill:#e8f1fc,stroke:#35689c,color:#102a43
+    classDef pending fill:#fff3d6,stroke:#9a6700,color:#493500,stroke-dasharray:5 3
+    classDef external fill:#f1f3f5,stroke:#6b7280,color:#202938
+    classDef outcome fill:#e6f4ea,stroke:#33734a,color:#173d26
 ```
+
+失败的校验或同 ID 不同内容不会得到接纳回执。Provider 已接受但本地确认前崩溃时，重试仍可能重复发送；投递是 at-least-once。检测事件、收件人规则、业务调度、高可用及多租户隔离属于当前范围之外，不是图中隐含的待交付功能。
+
 
 典型场景包括：库存 monitor 发现商品到货、Agent 的长任务需要人工关注，或者 business service 出现 operational failure。Producer 决定**通知什么、何时通知**；本模块负责 notification 被接受之后的 reliable delivery。
 

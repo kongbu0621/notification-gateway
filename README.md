@@ -10,15 +10,46 @@ It does not detect events or decide when to notify. v0.1 provides a typed Python
 
 Use `notification-gateway` between an application that produces an important event and the Provider that sends the message. A direct Webhook call can silently lose the notification when the network or Provider fails, or when the producing process stops at the wrong moment. After this module successfully accepts a notification, the caller can safely replay the same request if acknowledgement was ambiguous; the durable record is then delivered with retry and restart recovery.
 
-```text
-event producer (monitor / business service / agent)
-        |
-        v
-notification-gateway
-  accept -> SQLite -> Worker -> Provider (WeCom today)
-              |          |
-              +-- retry / restart recovery --+
+The complete design is shown below. **Implemented** identifies v0.1 alpha source capabilities; yellow dashed nodes are optional, **unimplemented** providers. Gray nodes belong to the caller, operator, or provider. Durable acceptance and delivery are separate stages; `serve` does not drive the worker.
+
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 240}}}%%
+flowchart TD
+    A["Caller · Produce notification events<br/>Stable request_id and complete payload<br/>Replay the same request if acceptance is unclear"]
+    I["Implemented · Python / HTTP intake<br/>Request validation and idempotency conflicts"]
+    Q["Implemented · SQLite durable acceptance<br/>Commit before returning acceptance<br/>No atomic commit with caller business database"]
+    W["Implemented · DeliveryWorker<br/>Validate stored payload and claim with a lease<br/>Provider I/O outside write transactions"]
+    O["Operator · Supervisor / scheduler<br/>Repeatedly drive work-once<br/>Run explicit retention and purge policy"]
+    P["Implemented · WeCom adapter<br/>Call the configured provider"]
+    X["Unimplemented · Additional providers<br/>Optional deliver protocol implementations<br/>No dynamic plugin discovery system"]
+    R["Implemented · Persist outcome and recover<br/>delivered / bounded backoff retry / dead<br/>Expired leases retain the original request_id"]
+    H["Implemented · Status and terminal purge<br/>Status excludes notification content<br/>Preserve pending and retryable work"]
+    U["Caller receives acceptance and delivery status<br/>Handle actual failures and continue work<br/>Provider acceptance does not prove recipient read"]
+    A --> I
+    I --> Q
+    Q -->|"Acceptance receipt"| U
+    Q -->|"Due work"| W
+    O -->|"Drive delivery"| W
+    W --> P
+    W -.->|"Register a future implementation"| X
+    P -->|"Result or exception"| R
+    X -.->|"Same outcome contract"| R
+    R -->|"Retry within limits"| W
+    R --> H
+    O -->|"Explicit retention period"| H
+    H -->|"Read status"| U
+    class I,Q,W,P,R,H built
+    class X pending
+    class A,O external
+    class U outcome
+    classDef built fill:#e8f1fc,stroke:#35689c,color:#102a43
+    classDef pending fill:#fff3d6,stroke:#9a6700,color:#493500,stroke-dasharray:5 3
+    classDef external fill:#f1f3f5,stroke:#6b7280,color:#202938
+    classDef outcome fill:#e6f4ea,stroke:#33734a,color:#173d26
 ```
+
+Invalid requests and conflicting payloads under the same ID do not receive acceptance. A crash after provider acceptance but before local acknowledgement can still cause duplicate delivery; semantics are at least once. Event detection, recipient rules, business scheduling, high availability, and tenant isolation remain out of scope, not implicit future deliverables.
+
 
 Examples include a stock monitor reporting that an item is available, an Agent reporting that a long-running task needs human attention, or a business service reporting an operational failure. The producer decides **what** and **when** to notify; this module owns reliable delivery after acceptance.
 
