@@ -18,24 +18,27 @@ flowchart TD
     A["Caller · Produce notification events<br/>Stable request_id and complete payload<br/>Replay the same request if acceptance is unclear"]
     I["Implemented · Python / HTTP intake<br/>Request validation and idempotency conflicts"]
     Q["Implemented · SQLite durable acceptance<br/>Commit before returning acceptance<br/>No atomic commit with caller business database"]
-    W["Implemented · DeliveryWorker<br/>Validate stored payload and claim with a lease<br/>Provider I/O outside write transactions"]
+    W["Implemented · DeliveryWorker<br/>Recover expired leases before claiming due work<br/>Validate stored payload; provider I/O outside write transactions"]
     O["Operator · Supervisor / scheduler<br/>Repeatedly drive work-once<br/>Run explicit retention and purge policy"]
     P["Implemented · WeCom adapter<br/>Call the configured provider"]
     X["Unimplemented · Additional providers<br/>Optional deliver protocol implementations<br/>No dynamic plugin discovery system"]
-    R["Implemented · Persist outcome and recover<br/>delivered / bounded backoff retry / dead<br/>Expired leases retain the original request_id"]
+    R["Implemented · Validate and persist outcomes<br/>Valid DeliveryResult and committed confirmation: delivered<br/>Classify failures as retry / dead; keep request_id"]
     H["Implemented · Status and terminal purge<br/>Status excludes notification content<br/>Preserve pending and retryable work"]
     U["Caller receives acceptance and delivery status<br/>Handle actual failures and continue work<br/>Provider acceptance does not prove recipient read"]
     A --> I
     I --> Q
     Q -->|"Acceptance receipt"| U
+    Q -->|"Status also available before delivery"| H
     Q -->|"Due work"| W
     O -->|"Drive delivery"| W
-    W --> P
+    W -->|"Valid payload and available provider"| P
+    W -->|"Invalid payload or exhausted attempts: dead, no send"| H
+    W -->|"Provider unavailable: terminal failure"| R
     W -.->|"Register a future implementation"| X
     P -->|"Result or exception"| R
     X -.->|"Same outcome contract"| R
-    R -->|"Retry within limits"| W
-    R --> H
+    R -->|"Retry when due and within limits"| W
+    R -->|"Committed state"| H
     O -->|"Explicit retention period"| H
     H -->|"Read status"| U
     class I,Q,W,P,R,H built

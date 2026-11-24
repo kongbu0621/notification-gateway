@@ -18,24 +18,27 @@ flowchart TD
     A["调用方 · 产生通知事件<br/>稳定 request_id 与完整请求<br/>结果不明时重放同一请求"]
     I["已实现 · Python / HTTP Intake<br/>校验请求与幂等冲突"]
     Q["已实现 · SQLite 持久接纳<br/>先提交请求，再返回接纳回执<br/>不与调用方业务库跨库原子提交"]
-    W["已实现 · DeliveryWorker<br/>校验持久载荷并以租约认领<br/>Provider I/O 在写事务外"]
+    W["已实现 · DeliveryWorker<br/>先恢复到期租约，再认领到期工作<br/>校验持久载荷；Provider I/O 在写事务外"]
     O["运营者 · Supervisor / Scheduler<br/>反复驱动 work-once<br/>显式执行保留与清理策略"]
     P["已实现 · WeCom Adapter<br/>调用已配置的 Provider"]
     X["待实现 · 按需新增 Provider<br/>通过 deliver 协议接入<br/>没有动态插件发现系统"]
-    R["已实现 · 结果持久化与恢复<br/>delivered / 有界退避 retry / dead<br/>过期租约按原 request_id 恢复"]
+    R["已实现 · 核验并持久保存结果<br/>有效 DeliveryResult 且成功确认提交：delivered<br/>失败分类进入 retry / dead；保留 request_id"]
     H["已实现 · 状态与终态清理<br/>状态不含通知内容<br/>purge 保留 pending / retryable 工作"]
     U["调用方取得接纳与投递状态<br/>按实际失败继续处理<br/>Provider 接受不证明收件人已读"]
     A --> I
     I --> Q
     Q -->|"接纳回执"| U
+    Q -->|"投递前也可查询状态"| H
     Q -->|"到期工作"| W
     O -->|"驱动投递"| W
-    W --> P
+    W -->|"载荷有效且 Provider 可用"| P
+    W -->|"坏载荷或次数耗尽：dead，不发送"| H
+    W -->|"Provider 未配置：终态失败"| R
     W -.->|"未来注册相应实现"| X
     P -->|"结果或异常"| R
     X -.->|"相同结果合同"| R
-    R -->|"预算内重试"| W
-    R --> H
+    R -->|"到期且未耗尽时重试"| W
+    R -->|"已提交的状态"| H
     O -->|"显式保留期限"| H
     H -->|"查询状态"| U
     class I,Q,W,P,R,H built
